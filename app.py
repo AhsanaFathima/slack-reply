@@ -13,23 +13,22 @@ SLACK_CHANNEL_ID = "C0A068PHZMY"  # Your #shopify-slack channel
 order_threads = {}
 
 def format_phone(phone):
-    """Format phone number like Shopify does"""
+    """Format phone number"""
     if not phone:
         return "N/A"
-    # Remove spaces and special characters
     phone = ''.join(filter(str.isdigit, str(phone)))
     if phone.startswith('971') and len(phone) == 12:
         return f"+{phone[:3]}{phone[3:]}"
     return phone
 
 def create_order_message(order_data):
-    """Create EXACT Shopify-style order notification"""
+    """Create Shopify-style order notification"""
     order_number = order_data.get('order_number', 'N/A')
     customer = order_data.get('customer', {})
     customer_name = customer.get('name', 'Customer')
     phone = format_phone(customer.get('phone', 'N/A'))
     
-    # Get items like Shopify format
+    # Get items
     line_items = order_data.get('line_items', [])
     items_text = ""
     
@@ -38,7 +37,6 @@ def create_order_message(order_data):
         variant = item.get('variant_title', '')
         quantity = item.get('quantity', 1)
         
-        # Format: "Product Name Variant | quantity"
         item_line = f"{item_name}"
         if variant:
             item_line += f" {variant}"
@@ -49,13 +47,13 @@ def create_order_message(order_data):
     if not items_text:
         items_text = "Item | 1"
     
-    # Create EXACT Shopify format
+    # Create Shopify format
     message_text = f"New Shopify Order Received!\n\n#{order_number} | {customer_name} | {phone} | {items_text.strip()}"
     
     return message_text
 
 def send_order_notification(order_data):
-    """Send order notification in EXACT Shopify format"""
+    """Send order notification"""
     headers = {
         'Authorization': f'Bearer {SLACK_BOT_TOKEN}',
         'Content-Type': 'application/json'
@@ -89,8 +87,8 @@ def send_order_notification(order_data):
     
     return None
 
-def send_payment_update(order_number, status, amount="", method=""):
-    """Send payment update as threaded reply"""
+def send_status_update(order_number, status_type, status, details=None):
+    """Send status update as threaded reply"""
     if order_number not in order_threads:
         print(f"❌ Order #{order_number} not found")
         return False
@@ -101,24 +99,40 @@ def send_payment_update(order_number, status, amount="", method=""):
         'Content-Type': 'application/json'
     }
     
-    # Status mapping
-    status_config = {
-        'pending': {'emoji': '⏳', 'text': 'Payment Pending'},
-        'paid': {'emoji': '✅', 'text': 'Payment Received'},
-        'authorized': {'emoji': '🔒', 'text': 'Payment Authorized'},
-        'refunded': {'emoji': '↩️', 'text': 'Refund Processed'},
-        'partially_paid': {'emoji': '💰', 'text': 'Partially Paid'}
+    # PAYMENT STATUS MAPPING
+    payment_status = {
+        'pending': {'emoji': '⏳', 'text': 'Payment Pending', 'prefix': '💳'},
+        'paid': {'emoji': '✅', 'text': 'Payment Received', 'prefix': '💳'},
+        'authorized': {'emoji': '🔒', 'text': 'Payment Authorized', 'prefix': '💳'},
+        'refunded': {'emoji': '↩️', 'text': 'Refund Processed', 'prefix': '💳'},
+        'voided': {'emoji': '❌', 'text': 'Payment Voided', 'prefix': '💳'},
     }
     
-    config = status_config.get(status, {'emoji': '📝', 'text': status.title()})
+    # FULFILLMENT STATUS MAPPING
+    fulfillment_status = {
+        'fulfilled': {'emoji': '🚀', 'text': 'Order Fulfilled', 'prefix': '📦'},
+        'unfulfilled': {'emoji': '📦', 'text': 'Order Not Fulfilled', 'prefix': '📦'},
+        'in_progress': {'emoji': '⚙️', 'text': 'Fulfillment In Progress', 'prefix': '📦'},
+        'on_hold': {'emoji': '⏸️', 'text': 'Fulfillment On Hold', 'prefix': '📦'},
+        'partially_fulfilled': {'emoji': '📤', 'text': 'Partially Fulfilled', 'prefix': '📦'},
+    }
+    
+    # Combine all statuses
+    all_status = {**payment_status, **fulfillment_status}
+    
+    # Get config for this status
+    config = all_status.get(status, {'emoji': '📝', 'text': status.replace('_', ' ').title(), 'prefix': '📝'})
+    
     time_now = datetime.now().strftime("%I:%M %p")
     
-    # Create threaded reply
-    message_text = f"{config['emoji']} {config['text']} • {time_now}"
-    if amount:
-        message_text += f"\nAmount: ${amount}"
-    if method:
-        message_text += f"\nMethod: {method}"
+    # Create message
+    message_text = f"{config['prefix']} {config['emoji']} *{config['text']}* • {time_now}"
+    
+    # Add details if provided
+    if details:
+        for key, value in details.items():
+            if value:
+                message_text += f"\n{key}: {value}"
     
     message = {
         'channel': SLACK_CHANNEL_ID,
@@ -136,7 +150,7 @@ def send_payment_update(order_number, status, amount="", method=""):
         if response.status_code == 200:
             result = response.json()
             if result.get('ok'):
-                print(f"✅ Payment update for #{order_number}: {status}")
+                print(f"✅ {status_type.title()} update for #{order_number}: {status}")
                 return True
     except Exception as e:
         print(f"❌ Error: {e}")
@@ -156,32 +170,60 @@ def shopify_webhook():
         
         order_number = data.get('order_number', data.get('name', 'N/A'))
         financial_status = data.get('financial_status', 'pending')
+        fulfillment_status = data.get('fulfillment_status', 'unfulfilled')
         total_price = data.get('total_price', '0.00')
         
         if webhook_topic == 'orders/create':
             # New order - send notification
             thread_ts = send_order_notification(data)
             if thread_ts:
-                # Send initial status
-                send_payment_update(order_number, 'created', total_price)
+                # Send initial payment status
+                send_status_update(
+                    order_number, 
+                    'payment',
+                    financial_status,
+                    {'Amount': f"${total_price}"}
+                )
                 return jsonify({'success': True}), 200
         
         elif webhook_topic == 'orders/updated':
-            # Order update - send payment status
+            # Order update - check what changed
+            
             # First, ensure we have a thread for this order
             if order_number not in order_threads:
                 send_order_notification(data)
             
-            # Send payment update
-            success = send_payment_update(
-                order_number, 
-                financial_status, 
-                total_price,
-                data.get('gateway', '')
-            )
+            details = {}
             
-            if success:
-                return jsonify({'success': True}), 200
+            # Check if payment status changed
+            if financial_status and financial_status != 'pending':
+                details['Amount'] = f"${total_price}"
+                if data.get('gateway'):
+                    details['Method'] = data.get('gateway')
+                
+                send_status_update(
+                    order_number,
+                    'payment',
+                    financial_status,
+                    details
+                )
+            
+            # Check if fulfillment status changed
+            if fulfillment_status and fulfillment_status != 'unfulfilled':
+                fulfillment_details = {}
+                if data.get('tracking_numbers'):
+                    fulfillment_details['Tracking'] = ', '.join(data.get('tracking_numbers', []))
+                if data.get('tracking_company'):
+                    fulfillment_details['Carrier'] = data.get('tracking_company')
+                
+                send_status_update(
+                    order_number,
+                    'fulfillment',
+                    fulfillment_status,
+                    fulfillment_details
+                )
+            
+            return jsonify({'success': True}), 200
         
         return jsonify({'success': True}), 200
         
@@ -189,25 +231,23 @@ def shopify_webhook():
         print(f"❌ Error: {str(e)}")
         return jsonify({'error': str(e)}), 400
 
-@app.route('/test-exact-format', methods=['GET'])
-def test_exact_format():
-    """Test EXACT format you want"""
-    # Test data matching your screenshot
+@app.route('/test-all-statuses', methods=['GET'])
+def test_all_statuses():
+    """Test ALL payment and fulfillment statuses"""
     test_data = {
-        'order_number': '1252',
+        'order_number': 'TEST-STATUS',
         'customer': {
-            'name': 'test test',
-            'phone': '+971545982212'
+            'name': 'Status Test Customer',
+            'phone': '+971501234567'
         },
         'line_items': [
             {
-                'name': 'Abercrombie & Fitch Authentic Night 100 ml',
-                'variant_title': 'EDP Women Perfume',
+                'name': 'Test Product',
+                'variant_title': '100ml EDP',
                 'quantity': 1
             }
         ],
-        'total_price': '149.99',
-        'financial_status': 'pending'
+        'total_price': '199.99'
     }
     
     # Send order notification
@@ -216,66 +256,84 @@ def test_exact_format():
     if not thread_ts:
         return jsonify({'error': 'Failed to create order'}), 500
     
-    # Simulate payment updates
-    updates = [
-        {'status': 'pending', 'amount': '149.99'},
-        {'status': 'paid', 'amount': '149.99', 'method': 'Credit Card'},
-        {'status': 'refunded', 'amount': '149.99', 'method': 'Credit Card'}
+    # Test ALL payment statuses
+    payment_statuses = [
+        {'status': 'pending', 'details': {'Amount': '$199.99'}},
+        {'status': 'authorized', 'details': {'Amount': '$199.99', 'Method': 'Credit Card'}},
+        {'status': 'paid', 'details': {'Amount': '$199.99', 'Method': 'Credit Card'}},
+        {'status': 'refunded', 'details': {'Amount': '$199.99', 'Method': 'Credit Card'}},
+        {'status': 'voided', 'details': {'Amount': '$199.99', 'Reason': 'Customer Request'}}
     ]
     
-    for update in updates:
-        send_payment_update(
+    # Test ALL fulfillment statuses
+    fulfillment_statuses = [
+        {'status': 'unfulfilled', 'details': {}},
+        {'status': 'in_progress', 'details': {'Note': 'Preparing for shipment'}},
+        {'status': 'on_hold', 'details': {'Reason': 'Waiting for stock'}},
+        {'status': 'partially_fulfilled', 'details': {'Fulfilled': '1 of 2 items'}},
+        {'status': 'fulfilled', 'details': {'Tracking': 'TRK123456', 'Carrier': 'DHL'}}
+    ]
+    
+    results = []
+    
+    # Send payment status updates
+    for payment in payment_statuses:
+        success = send_status_update(
             test_data['order_number'],
-            update['status'],
-            update['amount'],
-            update.get('method', '')
+            'payment',
+            payment['status'],
+            payment['details']
         )
+        results.append({'type': 'payment', 'status': payment['status'], 'success': success})
+    
+    # Send fulfillment status updates
+    for fulfillment in fulfillment_statuses:
+        success = send_status_update(
+            test_data['order_number'],
+            'fulfillment',
+            fulfillment['status'],
+            fulfillment['details']
+        )
+        results.append({'type': 'fulfillment', 'status': fulfillment['status'], 'success': success})
     
     return jsonify({
         'success': True,
-        'order': '1252',
-        'message': 'Check #shopify-slack for EXACT Shopify format with threaded payment updates'
+        'order': test_data['order_number'],
+        'results': results,
+        'message': 'All status updates sent. Check thread in #shopify-slack'
     })
 
-@app.route('/test-real-order', methods=['GET'])
-def test_real_order():
-    """Test with realistic order data"""
-    test_data = {
-        'order_number': '1251',
-        'customer': {
-            'name': 'test test',
-            'phone': '+971545982212'
-        },
-        'line_items': [
-            {
-                'name': 'Abdul Samad Al Qurashi Safari Extreme 75 ml',
-                'variant_title': 'EDP Unisex',
-                'quantity': 1
-            }
-        ],
-        'total_price': '129.99',
-        'financial_status': 'paid',
-        'gateway': 'Shopify Payments'
-    }
+@app.route('/test-specific/<order_number>/<status_type>/<status>', methods=['GET'])
+def test_specific(order_number, status_type, status):
+    """Test specific status update"""
+    details = {}
     
-    # Send order notification
-    thread_ts = send_order_notification(test_data)
+    if status_type == 'payment':
+        details = {'Amount': '$149.99', 'Method': 'Credit Card'}
+    elif status_type == 'fulfillment':
+        if status == 'fulfilled':
+            details = {'Tracking': 'ABC123XYZ', 'Carrier': 'DHL'}
+        elif status == 'in_progress':
+            details = {'Note': 'Processing in warehouse'}
     
-    if thread_ts:
-        # Send payment status
-        send_payment_update(
-            test_data['order_number'],
-            test_data['financial_status'],
-            test_data['total_price'],
-            test_data['gateway']
-        )
-        
+    # First ensure order exists
+    if order_number not in order_threads:
+        test_data = {
+            'order_number': order_number,
+            'customer': {'name': 'Test Customer', 'phone': '+971501234567'},
+            'line_items': [{'name': 'Test Item', 'quantity': 1}]
+        }
+        send_order_notification(test_data)
+    
+    success = send_status_update(order_number, status_type, status, details)
+    
+    if success:
         return jsonify({
             'success': True,
-            'order': test_data['order_number'],
-            'customer': test_data['customer']['name'],
-            'amount': test_data['total_price'],
-            'message': 'Realistic order posted to #shopify-slack'
+            'order': order_number,
+            'status_type': status_type,
+            'status': status,
+            'message': f'{status_type} update sent for order #{order_number}'
         })
     
     return jsonify({'error': 'Failed'}), 500
@@ -289,27 +347,32 @@ def home():
     return '''
     <html>
         <body style="font-family: Arial, sans-serif; padding: 20px;">
-            <h1>✅ Shopify → Slack (Exact Format)</h1>
-            <p><strong>Output Format:</strong> Exact Shopify notification style</p>
-            <p><strong>Channel:</strong> #shopify-slack</p>
+            <h1>✅ Shopify → Slack (Payment & Fulfillment Status)</h1>
+            <hr>
+            <h3>Payment Status:</h3>
+            <ul>
+                <li>⏳ Payment Pending</li>
+                <li>✅ Payment Received</li>
+                <li>🔒 Payment Authorized</li>
+                <li>↩️ Refund Processed</li>
+                <li>❌ Payment Voided</li>
+            </ul>
+            
+            <h3>Fulfillment Status:</h3>
+            <ul>
+                <li>📦 Order Not Fulfilled</li>
+                <li>⚙️ Fulfillment In Progress</li>
+                <li>⏸️ Fulfillment On Hold</li>
+                <li>📤 Partially Fulfilled</li>
+                <li>🚀 Order Fulfilled</li>
+            </ul>
             <hr>
             <h3>Test Endpoints:</h3>
             <ul>
-                <li><a href="/test-exact-format">/test-exact-format</a> - EXACT format you want</li>
-                <li><a href="/test-real-order">/test-real-order</a> - Realistic order</li>
+                <li><a href="/test-all-statuses">/test-all-statuses</a> - Test ALL statuses</li>
+                <li><a href="/test-specific/TEST123/payment/paid">/test-specific/ORDER/STATUS_TYPE/STATUS</a> - Test specific</li>
                 <li><a href="/health">/health</a> - Health check</li>
             </ul>
-            <hr>
-            <h3>Expected Output in Slack:</h3>
-            <pre>
-New Shopify Order Received!
-
-#1252 | test test | +971545982212 | Abercrombie & Fitch Authentic Night 100 ml EDP Women Perfume | 1
-  ↓ (click thread to see)
-     ⏳ Payment Pending • 2:30 PM
-     ✅ Payment Received • 2:31 PM
-     ↩️ Refund Processed • 2:32 PM
-            </pre>
         </body>
     </html>
     '''
