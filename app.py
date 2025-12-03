@@ -16,83 +16,127 @@ def format_phone(phone):
     """Format phone number"""
     if not phone:
         return "N/A"
-    phone = ''.join(filter(str.isdigit, str(phone)))
-    if phone.startswith('971') and len(phone) == 12:
-        return f"+{phone[:3]} {phone[3:]}"
-    return phone
+    try:
+        phone = str(phone)
+        phone = ''.join(filter(str.isdigit, phone))
+        if phone.startswith('971') and len(phone) == 12:
+            return f"+{phone[:3]} {phone[3:]}"
+        return phone
+    except:
+        return "N/A"
 
-def create_simple_table(order_data):
-    """Create SIMPLE table with only required fields"""
-    order_number = order_data.get('order_number', 'N/A')
-    customer = order_data.get('customer', {})
-    customer_name = customer.get('name', 'Customer')
-    phone = format_phone(customer.get('phone', 'N/A'))
-    
-    # Get first item only (as per your example)
-    line_items = order_data.get('line_items', [])
-    item_info = "N/A"
-    quantity = "N/A"
-    
-    if line_items:
-        first_item = line_items[0]
-        item_name = first_item.get('name', 'Item')
-        variant = first_item.get('variant_title', '')
-        item_info = f"{item_name}"
-        if variant:
-            item_info += f" {variant}"
-        quantity = str(first_item.get('quantity', 1))
-    
-    # Create SIMPLE table format
-    message = "📦 *NEW ORDER*\n"
-    message += "┌─────────────────────────────────────┐\n"
-    message += f"│ {'Order #:':<15} {order_number:<20} │\n"
-    message += f"│ {'Customer:':<15} {customer_name:<20} │\n"
-    message += f"│ {'Phone:':<15} {phone:<20} │\n"
-    message += f"│ {'Item:':<15} {item_info:<20} │\n"
-    message += f"│ {'Quantity:':<15} {quantity:<20} │\n"
-    message += "└─────────────────────────────────────┘"
-    
-    return message
+def truncate_text(text, max_length=20):
+    """Truncate text if too long for table"""
+    if not text:
+        return ""
+    text = str(text)
+    if len(text) <= max_length:
+        return text
+    return text[:max_length-3] + "..."
+
+def create_proper_table(order_data):
+    """Create PROPER table format"""
+    try:
+        order_number = order_data.get('order_number') or order_data.get('name', 'N/A')
+        customer = order_data.get('customer', {})
+        customer_name = customer.get('name', 'Customer')
+        phone = format_phone(customer.get('phone', 'N/A'))
+        
+        # Get first item only
+        line_items = order_data.get('line_items', [])
+        item_info = "N/A"
+        quantity = "N/A"
+        
+        if line_items:
+            first_item = line_items[0]
+            item_name = first_item.get('name', 'Item')
+            variant = first_item.get('variant_title', '')
+            item_info = f"{item_name}"
+            if variant:
+                item_info += f" {variant}"
+            quantity = str(first_item.get('quantity', 1))
+        
+        # Truncate long text
+        order_display = truncate_text(order_number, 18)
+        customer_display = truncate_text(customer_name, 18)
+        phone_display = truncate_text(phone, 18)
+        item_display = truncate_text(item_info, 18)
+        quantity_display = truncate_text(quantity, 18)
+        
+        # Create PROPER table format with box drawing
+        message = "📦 *NEW ORDER*\n"
+        message += "┌─────────────────────────────────────┐\n"
+        message += f"│ Order #:     {order_display:<18} │\n"
+        message += f"│ Customer:    {customer_display:<18} │\n"
+        message += f"│ Phone:       {phone_display:<18} │\n"
+        message += f"│ Item:        {item_display:<18} │\n"
+        message += f"│ Quantity:    {quantity_display:<18} │\n"
+        message += "└─────────────────────────────────────┘"
+        
+        return message
+    except Exception as e:
+        print(f"❌ Error creating table: {e}")
+        return "📦 *NEW ORDER*\nError creating table"
 
 def send_order_notification(order_data):
-    """Send order notification in SIMPLE table format"""
+    """Send order notification in PROPER table format"""
+    if not SLACK_BOT_TOKEN:
+        print("❌ No Slack bot token configured")
+        return None
+    
     headers = {
         'Authorization': f'Bearer {SLACK_BOT_TOKEN}',
         'Content-Type': 'application/json'
     }
     
-    order_number = order_data.get('order_number', 'N/A')
-    message_text = create_simple_table(order_data)
-    
-    # Send the order notification
-    message = {
-        'channel': SLACK_CHANNEL_ID,
-        'text': message_text
-    }
-    
     try:
+        order_number = order_data.get('order_number') or order_data.get('name', 'N/A')
+        message_text = create_proper_table(order_data)
+        
+        print(f"📤 Sending order #{order_number} to Slack...")
+        print(f"📋 Message preview:\n{message_text}")
+        
+        # Send the order notification
+        message = {
+            'channel': SLACK_CHANNEL_ID,
+            'text': message_text
+        }
+        
         response = requests.post(
             'https://slack.com/api/chat.postMessage',
             headers=headers,
-            json=message
+            json=message,
+            timeout=10
         )
+        
+        print(f"📡 Slack API response: {response.status_code}")
         
         if response.status_code == 200:
             result = response.json()
+            
             if result.get('ok'):
                 thread_ts = result['ts']
                 order_threads[order_number] = thread_ts
                 print(f"✅ Order #{order_number} notification sent")
                 return thread_ts
+            else:
+                print(f"❌ Slack error: {result.get('error')}")
+        else:
+            print(f"❌ HTTP error: {response.status_code}")
+            
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error sending to Slack: {e}")
     
     return None
 
 def send_status_update(order_number, status_type, status, details=None):
     """Send status update as threaded reply"""
+    if not SLACK_BOT_TOKEN:
+        print("❌ No Slack bot token configured")
+        return False
+    
     if order_number not in order_threads:
-        print(f"❌ Order #{order_number} not found")
+        print(f"❌ Order #{order_number} not found in threads")
         return False
     
     thread_ts = order_threads[order_number]
@@ -118,43 +162,49 @@ def send_status_update(order_number, status_type, status, details=None):
         'on hold': {'emoji': '⏸️', 'text': 'On Hold'},
     }
     
-    # Get config based on status type
-    if status_type == 'payment':
-        status_map = payment_status
-        prefix = '💳'
-    elif status_type == 'fulfillment':
-        status_map = fulfillment_status
-        prefix = '📦'
-    else:
-        status_map = {}
-        prefix = '📝'
-    
-    # Get exact status (case-insensitive)
-    status_lower = status.lower()
-    config = status_map.get(status_lower, {'emoji': '📝', 'text': status.title()})
-    
-    time_now = datetime.now().strftime("%I:%M %p")
-    
-    # Create message
-    message_text = f"{prefix} {config['emoji']} *{config['text']}* • {time_now}"
-    
-    # Add details if provided
-    if details:
-        for key, value in details.items():
-            if value:
-                message_text += f"\n{key}: {value}"
-    
-    message = {
-        'channel': SLACK_CHANNEL_ID,
-        'thread_ts': thread_ts,
-        'text': message_text
-    }
-    
     try:
+        # Get config based on status type
+        if status_type == 'payment':
+            status_map = payment_status
+            prefix = '💳'
+        elif status_type == 'fulfillment':
+            status_map = fulfillment_status
+            prefix = '📦'
+        else:
+            status_map = {}
+            prefix = '📝'
+        
+        # Get exact status (case-insensitive)
+        if status:
+            status_lower = status.lower()
+            config = status_map.get(status_lower, {'emoji': '📝', 'text': status.title() if status else 'Unknown'})
+        else:
+            config = {'emoji': '❓', 'text': 'Unknown Status'}
+        
+        time_now = datetime.now().strftime("%I:%M %p")
+        
+        # Create message
+        message_text = f"{prefix} {config['emoji']} *{config['text']}* • {time_now}"
+        
+        # Add details if provided
+        if details:
+            for key, value in details.items():
+                if value:
+                    message_text += f"\n{key}: {value}"
+        
+        message = {
+            'channel': SLACK_CHANNEL_ID,
+            'thread_ts': thread_ts,
+            'text': message_text
+        }
+        
+        print(f"📤 Sending status update for #{order_number}: {status}")
+        
         response = requests.post(
             'https://slack.com/api/chat.postMessage',
             headers=headers,
-            json=message
+            json=message,
+            timeout=10
         )
         
         if response.status_code == 200:
@@ -162,26 +212,36 @@ def send_status_update(order_number, status_type, status, details=None):
             if result.get('ok'):
                 print(f"✅ {status_type.title()} update for #{order_number}: {status}")
                 return True
+            
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error sending status update: {e}")
     
     return False
 
 @app.route('/webhook/shopify', methods=['POST'])
 def shopify_webhook():
     """Handle Shopify webhooks"""
+    print("=" * 50)
     print("📩 Shopify webhook received")
     
     try:
-        data = request.json
-        webhook_topic = request.headers.get('X-Shopify-Topic', '')
+        data = request.get_json()
+        if not data:
+            print("❌ No JSON data received")
+            return jsonify({'error': 'No data received'}), 400
         
+        webhook_topic = request.headers.get('X-Shopify-Topic', 'Unknown')
         print(f"📦 Topic: {webhook_topic}")
         
-        order_number = data.get('order_number', data.get('name', 'N/A'))
-        financial_status = data.get('financial_status', 'pending').lower()
-        fulfillment_status = data.get('fulfillment_status', 'unfulfilled').lower()
+        # Extract order info with safe defaults
+        order_number = data.get('order_number') or data.get('name') or f"ID-{data.get('id', 'unknown')}"
+        financial_status = data.get('financial_status', 'pending')
+        fulfillment_status = data.get('fulfillment_status', 'unfulfilled')
         total_price = data.get('total_price', '0.00')
+        
+        print(f"📝 Order: #{order_number}")
+        print(f"💰 Payment: {financial_status}")
+        print(f"📦 Fulfillment: {fulfillment_status}")
         
         # Map Shopify status to our exact status names
         status_mapping = {
@@ -190,10 +250,11 @@ def shopify_webhook():
             'partial': 'partially fulfilled'
         }
         
-        payment_status = status_mapping.get(financial_status, financial_status)
-        fulfillment_status = status_mapping.get(fulfillment_status, fulfillment_status)
+        payment_status = status_mapping.get(financial_status.lower() if financial_status else '', financial_status)
+        fulfillment_status_mapped = status_mapping.get(fulfillment_status.lower() if fulfillment_status else '', fulfillment_status)
         
         if webhook_topic == 'orders/create':
+            print(f"🎉 New order created: #{order_number}")
             # New order - send notification
             thread_ts = send_order_notification(data)
             if thread_ts:
@@ -204,17 +265,18 @@ def shopify_webhook():
                     payment_status,
                     {'Amount': f"${total_price}"}
                 )
-                return jsonify({'success': True}), 200
+                return jsonify({'success': True, 'order': order_number}), 200
         
         elif webhook_topic == 'orders/updated':
-            # Order update - check what changed
-            
+            print(f"🔄 Order updated: #{order_number}")
             # First, ensure we have a thread for this order
             if order_number not in order_threads:
+                print(f"🔍 Creating new thread for order #{order_number}")
                 send_order_notification(data)
             
             # Check if payment status changed
             if financial_status and financial_status != 'pending':
+                print(f"💰 Payment status changed to: {financial_status}")
                 details = {'Amount': f"${total_price}"}
                 if data.get('gateway'):
                     details['Method'] = data.get('gateway')
@@ -228,6 +290,7 @@ def shopify_webhook():
             
             # Check if fulfillment status changed
             if fulfillment_status and fulfillment_status != 'unfulfilled':
+                print(f"📦 Fulfillment status changed to: {fulfillment_status}")
                 fulfillment_details = {}
                 if data.get('tracking_numbers'):
                     fulfillment_details['Tracking'] = ', '.join(data.get('tracking_numbers', []))
@@ -237,21 +300,23 @@ def shopify_webhook():
                 send_status_update(
                     order_number,
                     'fulfillment',
-                    fulfillment_status,
+                    fulfillment_status_mapped,
                     fulfillment_details
                 )
             
-            return jsonify({'success': True}), 200
+            return jsonify({'success': True, 'order': order_number}), 200
         
         return jsonify({'success': True}), 200
         
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"❌ ERROR in webhook handler: {str(e)}")
+        import traceback
+        print(f"🔍 Traceback: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 400
 
-@app.route('/test-simple-table', methods=['GET'])
-def test_simple_table():
-    """Test SIMPLE table format"""
+@app.route('/test-table', methods=['GET'])
+def test_table():
+    """Test PROPER table format"""
     test_data = {
         'order_number': '1257',
         'customer': {
@@ -265,78 +330,25 @@ def test_simple_table():
                 'variant_title': 'CPO Unisex Perfume',
                 'quantity': 1
             }
-        ],
-        'financial_status': 'pending'
-    }
-    
-    # Send order notification in SIMPLE table format
-    thread_ts = send_order_notification(test_data)
-    
-    if not thread_ts:
-        return jsonify({'error': 'Failed to create order'}), 500
-    
-    # Test status updates
-    updates = [
-        {'type': 'payment', 'status': 'payment pending', 'details': {'Amount': '$149.99'}},
-        {'type': 'payment', 'status': 'paid', 'details': {'Amount': '$149.99', 'Method': 'Credit Card'}},
-        {'type': 'fulfillment', 'status': 'in progress', 'details': {}},
-        {'type': 'fulfillment', 'status': 'fulfilled', 'details': {'Tracking': 'TRK789012'}}
-    ]
-    
-    for update in updates:
-        send_status_update(
-            test_data['order_number'],
-            update['type'],
-            update['status'],
-            update['details']
-        )
-    
-    return jsonify({
-        'success': True,
-        'order': test_data['order_number'],
-        'message': 'Simple table format sent to #shopify-slack'
-    })
-
-@app.route('/test-multiple-items', methods=['GET'])
-def test_multiple_items():
-    """Test with multiple items (shows only first item)"""
-    test_data = {
-        'order_number': '1254',
-        'customer': {
-            'name': 'Test Customer',
-            'phone': '+971501234567'
-        },
-        'line_items': [
-            {
-                'name': 'Abercrombie & Fitch Authentic Night 100 ml',
-                'variant_title': 'EDP Women Perfume',
-                'quantity': 1
-            },
-            {
-                'name': 'Abercrombie & Fitch Authentic Night 100 ml',
-                'variant_title': 'EDT Men Perfume',
-                'quantity': 1
-            }
         ]
     }
     
     thread_ts = send_order_notification(test_data)
     
     if thread_ts:
-        send_status_update(
-            test_data['order_number'],
-            'payment',
-            'paid',
-            {'Amount': '$299.98'}
-        )
+        # Send test updates
+        send_status_update(test_data['order_number'], 'payment', 'payment pending', {'Amount': '$149.99'})
+        send_status_update(test_data['order_number'], 'payment', 'paid', {'Amount': '$149.99', 'Method': 'Credit Card'})
+        send_status_update(test_data['order_number'], 'fulfillment', 'in progress', {})
+        send_status_update(test_data['order_number'], 'fulfillment', 'fulfilled', {'Tracking': 'TRK123456'})
         
         return jsonify({
             'success': True,
             'order': test_data['order_number'],
-            'note': 'Only first item shown in table'
+            'message': 'PROPER table format sent. Check #shopify-slack channel!'
         })
     
-    return jsonify({'error': 'Failed'}), 500
+    return jsonify({'error': 'Failed to send'}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -347,35 +359,21 @@ def home():
     return '''
     <html>
         <body style="font-family: Arial, sans-serif; padding: 20px;">
-            <h1>✅ Shopify → Slack (Simple Table)</h1>
-            <hr>
-            <h3>Table Format:</h3>
-            <pre>
+            <h1>✅ Shopify → Slack (Table Format)</h1>
+            <p><strong>Table Format Example:</strong></p>
+            <pre style="background: #f5f5f5; padding: 10px; border-radius: 5px;">
 📦 NEW ORDER
 ┌─────────────────────────────────────┐
-│ Order #:          1257              │
-│ Customer:         Ahsana            │
-│ Phone:            +971 545982212    │
-│ Item:             Ahmed Al Maghribi │
-│                   Bidun Esam 12 ml  │
-│                   CPO Unisex Perfume│
-│ Quantity:         1                 │
+│ Order #:     1257                   │
+│ Customer:    Ahsana                 │
+│ Phone:       +971 545982212         │
+│ Item:        Ahmed Al Maghribi...   │
+│ Quantity:    1                      │
 └─────────────────────────────────────┘
             </pre>
-            
-            <h3>Status Updates (Threaded):</h3>
-            <ul>
-                <li>💳 ⏳ Payment Pending • 6:48 PM</li>
-                <li>💳 ✅ Payment Paid • 6:49 PM</li>
-                <li>📦 ⚙️ In Progress • 6:50 PM</li>
-                <li>📦 🚀 Fulfilled • 6:51 PM</li>
-            </ul>
             <hr>
-            <h3>Test:</h3>
-            <ul>
-                <li><a href="/test-simple-table">/test-simple-table</a> - Test simple table</li>
-                <li><a href="/health">/health</a> - Health check</li>
-            </ul>
+            <p><a href="/test-table">/test-table</a> - Test table format</p>
+            <p><a href="/health">/health</a> - Health check</p>
         </body>
     </html>
     '''
