@@ -9,370 +9,336 @@ app = Flask(__name__)
 SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN')
 SLACK_CHANNEL_ID = "C0A068PHZMY"  # Your #shopify-slack channel
 
-# Store thread timestamps {order_number: thread_ts}
+# Debug mode - disable webhook verification for testing
+DEBUG_MODE = True  # Set to False in production
+
+# Store order threads (in memory)
 order_threads = {}
 
-def format_phone(phone):
-    """Format phone number"""
-    if not phone:
-        return "N/A"
-    phone = ''.join(filter(str.isdigit, str(phone)))
-    if phone.startswith('971') and len(phone) == 12:
-        return f"+{phone[:3]}{phone[3:]}"
-    return phone
 
-def create_order_message(order_data):
-    """Create Shopify-style order notification"""
-    order_number = order_data.get('order_number', 'N/A')
-    customer = order_data.get('customer', {})
-    customer_name = customer.get('name', 'Customer')
-    phone = format_phone(customer.get('phone', 'N/A'))
-    
-    # Get items
-    line_items = order_data.get('line_items', [])
-    items_text = ""
-    
-    for item in line_items:
-        item_name = item.get('name', '')
-        variant = item.get('variant_title', '')
-        quantity = item.get('quantity', 1)
-        
-        item_line = f"{item_name}"
-        if variant:
-            item_line += f" {variant}"
-        item_line += f" | {quantity}"
-        
-        items_text += f"{item_line}\n"
-    
-    if not items_text:
-        items_text = "Item | 1"
-    
-    # Create Shopify format
-    message_text = f"New Shopify Order Received!\n\n#{order_number} | {customer_name} | {phone} | {items_text.strip()}"
-    
-    return message_text
+def send_to_slack(
+    order_number,
+    status,
+    customer_name,
+    amount,
+    customer_email="",
+    phone="",
+    item_name="",
+    quantity=""
+):
+    """
+    Send message to Slack.
 
-def send_order_notification(order_data):
-    """Send order notification"""
+    - If status == 'created'  -> create parent message like the screenshot
+    - Else                    -> send status message as a reply in that thread
+    """
     headers = {
         'Authorization': f'Bearer {SLACK_BOT_TOKEN}',
         'Content-Type': 'application/json'
     }
-    
-    order_number = order_data.get('order_number', 'N/A')
-    message_text = create_order_message(order_data)
-    
-    # Send the order notification
-    message = {
-        'channel': SLACK_CHANNEL_ID,
-        'text': message_text
-    }
-    
-    try:
-        response = requests.post(
-            'https://slack.com/api/chat.postMessage',
-            headers=headers,
-            json=message
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('ok'):
-                thread_ts = result['ts']
-                order_threads[order_number] = thread_ts
-                print(f"✅ Order #{order_number} notification sent")
-                return thread_ts
-    except Exception as e:
-        print(f"❌ Error: {e}")
-    
-    return None
 
-def send_status_update(order_number, status_type, status, details=None):
-    """Send status update as threaded reply"""
-    if order_number not in order_threads:
-        print(f"❌ Order #{order_number} not found")
-        return False
-    
-    thread_ts = order_threads[order_number]
-    headers = {
-        'Authorization': f'Bearer {SLACK_BOT_TOKEN}',
-        'Content-Type': 'application/json'
+    # Status emojis
+    emojis = {
+        'pending': '⏳',
+        'paid': '✅',
+        'authorized': '🔒',
+        'refunded': '↩️',
+        'created': '📦',
+        'voided': '❌'
     }
-    
-    # PAYMENT STATUS MAPPING
-    payment_status = {
-        'pending': {'emoji': '⏳', 'text': 'Payment Pending', 'prefix': '💳'},
-        'paid': {'emoji': '✅', 'text': 'Payment Received', 'prefix': '💳'},
-        'authorized': {'emoji': '🔒', 'text': 'Payment Authorized', 'prefix': '💳'},
-        'refunded': {'emoji': '↩️', 'text': 'Refund Processed', 'prefix': '💳'},
-        'voided': {'emoji': '❌', 'text': 'Payment Voided', 'prefix': '💳'},
-    }
-    
-    # FULFILLMENT STATUS MAPPING
-    fulfillment_status = {
-        'fulfilled': {'emoji': '🚀', 'text': 'Order Fulfilled', 'prefix': '📦'},
-        'unfulfilled': {'emoji': '📦', 'text': 'Order Not Fulfilled', 'prefix': '📦'},
-        'in_progress': {'emoji': '⚙️', 'text': 'Fulfillment In Progress', 'prefix': '📦'},
-        'on_hold': {'emoji': '⏸️', 'text': 'Fulfillment On Hold', 'prefix': '📦'},
-        'partially_fulfilled': {'emoji': '📤', 'text': 'Partially Fulfilled', 'prefix': '📦'},
-    }
-    
-    # Combine all statuses
-    all_status = {**payment_status, **fulfillment_status}
-    
-    # Get config for this status
-    config = all_status.get(status, {'emoji': '📝', 'text': status.replace('_', ' ').title(), 'prefix': '📝'})
-    
+
+    status = (status or '').lower()
+    emoji = emojis.get(status, '📦')
     time_now = datetime.now().strftime("%I:%M %p")
-    
-    # Create message
-    message_text = f"{config['prefix']} {config['emoji']} *{config['text']}* • {time_now}"
-    
-    # Add details if provided
-    if details:
-        for key, value in details.items():
-            if value:
-                message_text += f"\n{key}: {value}"
-    
-    message = {
+
+    # -----------------------------
+    # 1) NEW ORDER MESSAGE (PARENT)
+    # -----------------------------
+    if status == 'created':
+        # Format exactly like your screenshot
+        # Line 1
+        message_text = "🛒 New Shopify Order Received!\n"
+
+        # Line 2: #1256 | Name | Phone | Item | Qty
+        line2_parts = [
+            f"#{order_number}",
+            customer_name or "Customer",
+            phone or "No phone",
+            item_name or "Item",
+            str(quantity or "1")
+        ]
+        message_text += " | ".join(line2_parts)
+
+        data = {
+            'channel': SLACK_CHANNEL_ID,
+            'text': message_text
+        }
+
+        try:
+            response = requests.post(
+                'https://slack.com/api/chat.postMessage',
+                headers=headers,
+                json=data
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('ok'):
+                    # Save ts for future thread replies
+                    order_threads[order_number] = result['ts']
+                    print(f"✅ Created parent message & thread for order #{order_number}")
+                    return True
+                else:
+                    print(f"❌ Slack error (parent): {result.get('error')}")
+                    return False
+            else:
+                print(f"❌ Slack HTTP error (parent): {response.status_code}")
+                return False
+        except Exception as e:
+            print(f"❌ Error creating parent message: {e}")
+            return False
+
+    # --------------------------------
+    # 2) STATUS UPDATE (THREAD REPLY)
+    # --------------------------------
+    # If we don't yet know this order's thread (app restarted, etc),
+    # create a parent message first so we have something to reply under.
+    if order_number not in order_threads:
+        parent_text = "🛒 New Shopify Order Received!\n"
+        parent_line2 = " | ".join([
+            f"#{order_number}",
+            customer_name or "Customer",
+            phone or "No phone",
+            item_name or "Item",
+            str(quantity or "1")
+        ])
+        parent_text += parent_line2
+
+        parent_data = {
+            'channel': SLACK_CHANNEL_ID,
+            'text': parent_text
+        }
+
+        try:
+            parent_res = requests.post(
+                'https://slack.com/api/chat.postMessage',
+                headers=headers,
+                json=parent_data
+            )
+            if parent_res.status_code == 200:
+                parent_result = parent_res.json()
+                if parent_result.get('ok'):
+                    order_threads[order_number] = parent_result['ts']
+                    print(f"ℹ️ Parent message auto-created for order #{order_number}")
+                else:
+                    print(f"❌ Slack error (auto-parent): {parent_result.get('error')}")
+                    return False
+            else:
+                print(f"❌ Slack HTTP error (auto-parent): {parent_res.status_code}")
+                return False
+        except Exception as e:
+            print(f"❌ Error auto-creating parent: {e}")
+            return False
+
+    thread_ts = order_threads.get(order_number)
+    if not thread_ts:
+        print(f"❌ No thread_ts for order #{order_number}")
+        return False
+
+    # Build status message in thread
+    # 🔴 as you requested: NO customer name, NO email in thread
+    message_text = f"{emoji} *{status.upper()}* • {time_now}\n"
+    message_text += f"Order: #{order_number}\n"
+    message_text += f"Amount: ${amount}"
+
+    data = {
         'channel': SLACK_CHANNEL_ID,
         'thread_ts': thread_ts,
         'text': message_text
     }
-    
+
     try:
         response = requests.post(
             'https://slack.com/api/chat.postMessage',
             headers=headers,
-            json=message
+            json=data
         )
-        
         if response.status_code == 200:
             result = response.json()
             if result.get('ok'):
-                print(f"✅ {status_type.title()} update for #{order_number}: {status}")
+                print(f"✅ Thread reply sent for order #{order_number} ({status})")
                 return True
+            else:
+                print(f"❌ Slack error (thread): {result.get('error')}")
+                return False
+        else:
+            print(f"❌ Slack HTTP error (thread): {response.status_code}")
+            return False
     except Exception as e:
-        print(f"❌ Error: {e}")
-    
-    return False
+        print(f"❌ Error sending thread reply: {e}")
+        return False
+
 
 @app.route('/webhook/shopify', methods=['POST'])
 def shopify_webhook():
-    """Handle Shopify webhooks"""
-    print("📩 Shopify webhook received")
-    
+    """Receive Shopify webhooks - NO VERIFICATION FOR NOW"""
+    print("📩 Shopify webhook received!")
+
     try:
-        data = request.json
-        webhook_topic = request.headers.get('X-Shopify-Topic', '')
-        
-        print(f"📦 Topic: {webhook_topic}")
-        
-        order_number = data.get('order_number', data.get('name', 'N/A'))
+        # Log headers for debugging
+        print(f"Headers: {dict(request.headers)}")
+
+        # Get the data
+        data = request.get_json()
+        if not data:
+            print("❌ No JSON data received")
+            return jsonify({'error': 'No data'}), 400
+
+        print(f"📦 Webhook data: {data}")
+
+        # Extract basic order info
+        order_id = data.get('id')
+        order_number = str(data.get('order_number', f"{order_id}")).lstrip("#")
         financial_status = data.get('financial_status', 'pending')
-        fulfillment_status = data.get('fulfillment_status', 'unfulfilled')
-        total_price = data.get('total_price', '0.00')
-        
+        total_price = data.get('total_price', '0')
+
+        # Get customer info
+        customer = data.get('customer', {}) or {}
+        customer_name = customer.get('name') or (
+            (customer.get('first_name', '') + " " + customer.get('last_name', '')).strip()
+        ) or 'Customer'
+        customer_email = data.get('contact_email') or customer.get('email', '')
+
+        # Phone: shipping -> billing -> customer
+        shipping_address = data.get('shipping_address') or {}
+        billing_address = data.get('billing_address') or {}
+        phone = (
+            shipping_address.get('phone') or
+            billing_address.get('phone') or
+            customer.get('phone') or
+            ""
+        )
+
+        # Item name & quantity (like screenshot uses first item)
+        line_items = data.get('line_items', []) or []
+        if line_items:
+            first_item = line_items[0]
+            item_name = first_item.get('title') or first_item.get('name', 'Item')
+            quantity = first_item.get('quantity', 1)
+        else:
+            item_name = ""
+            quantity = ""
+
+        # Check webhook type
+        webhook_topic = request.headers.get('X-Shopify-Topic', '')
+        print(f"📝 Webhook topic: {webhook_topic}")
+
+        # For new orders, use 'created' status (parent message)
         if webhook_topic == 'orders/create':
-            # New order - send notification
-            thread_ts = send_order_notification(data)
-            if thread_ts:
-                # Send initial payment status
-                send_status_update(
-                    order_number, 
-                    'payment',
-                    financial_status,
-                    {'Amount': f"${total_price}"}
-                )
-                return jsonify({'success': True}), 200
-        
-        elif webhook_topic == 'orders/updated':
-            # Order update - check what changed
-            
-            # First, ensure we have a thread for this order
-            if order_number not in order_threads:
-                send_order_notification(data)
-            
-            details = {}
-            
-            # Check if payment status changed
-            if financial_status and financial_status != 'pending':
-                details['Amount'] = f"${total_price}"
-                if data.get('gateway'):
-                    details['Method'] = data.get('gateway')
-                
-                send_status_update(
-                    order_number,
-                    'payment',
-                    financial_status,
-                    details
-                )
-            
-            # Check if fulfillment status changed
-            if fulfillment_status and fulfillment_status != 'unfulfilled':
-                fulfillment_details = {}
-                if data.get('tracking_numbers'):
-                    fulfillment_details['Tracking'] = ', '.join(data.get('tracking_numbers', []))
-                if data.get('tracking_company'):
-                    fulfillment_details['Carrier'] = data.get('tracking_company')
-                
-                send_status_update(
-                    order_number,
-                    'fulfillment',
-                    fulfillment_status,
-                    fulfillment_details
-                )
-            
+            status = 'created'
+        else:
+            status = financial_status or 'pending'
+
+        # Send to Slack
+        success = send_to_slack(
+            order_number=order_number,
+            status=status,
+            customer_name=customer_name,
+            amount=total_price,
+            customer_email=customer_email,
+            phone=phone,
+            item_name=item_name,
+            quantity=quantity
+        )
+
+        if success:
+            print(f"✅ Successfully processed order #{order_number}")
             return jsonify({'success': True}), 200
-        
-        return jsonify({'success': True}), 200
-        
+        else:
+            print(f"❌ Failed to send to Slack for order #{order_number}")
+            return jsonify({'error': 'Failed to send to Slack'}), 500
+
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"❌ Error processing webhook: {str(e)}")
         return jsonify({'error': str(e)}), 400
 
-@app.route('/test-all-statuses', methods=['GET'])
-def test_all_statuses():
-    """Test ALL payment and fulfillment statuses"""
-    test_data = {
-        'order_number': 'TEST-STATUS',
-        'customer': {
-            'name': 'Status Test Customer',
-            'phone': '+971501234567'
-        },
-        'line_items': [
-            {
-                'name': 'Test Product',
-                'variant_title': '100ml EDP',
-                'quantity': 1
-            }
-        ],
-        'total_price': '199.99'
-    }
-    
-    # Send order notification
-    thread_ts = send_order_notification(test_data)
-    
-    if not thread_ts:
-        return jsonify({'error': 'Failed to create order'}), 500
-    
-    # Test ALL payment statuses
-    payment_statuses = [
-        {'status': 'pending', 'details': {'Amount': '$199.99'}},
-        {'status': 'authorized', 'details': {'Amount': '$199.99', 'Method': 'Credit Card'}},
-        {'status': 'paid', 'details': {'Amount': '$199.99', 'Method': 'Credit Card'}},
-        {'status': 'refunded', 'details': {'Amount': '$199.99', 'Method': 'Credit Card'}},
-        {'status': 'voided', 'details': {'Amount': '$199.99', 'Reason': 'Customer Request'}}
-    ]
-    
-    # Test ALL fulfillment statuses
-    fulfillment_statuses = [
-        {'status': 'unfulfilled', 'details': {}},
-        {'status': 'in_progress', 'details': {'Note': 'Preparing for shipment'}},
-        {'status': 'on_hold', 'details': {'Reason': 'Waiting for stock'}},
-        {'status': 'partially_fulfilled', 'details': {'Fulfilled': '1 of 2 items'}},
-        {'status': 'fulfilled', 'details': {'Tracking': 'TRK123456', 'Carrier': 'DHL'}}
-    ]
-    
-    results = []
-    
-    # Send payment status updates
-    for payment in payment_statuses:
-        success = send_status_update(
-            test_data['order_number'],
-            'payment',
-            payment['status'],
-            payment['details']
-        )
-        results.append({'type': 'payment', 'status': payment['status'], 'success': success})
-    
-    # Send fulfillment status updates
-    for fulfillment in fulfillment_statuses:
-        success = send_status_update(
-            test_data['order_number'],
-            'fulfillment',
-            fulfillment['status'],
-            fulfillment['details']
-        )
-        results.append({'type': 'fulfillment', 'status': fulfillment['status'], 'success': success})
-    
-    return jsonify({
-        'success': True,
-        'order': test_data['order_number'],
-        'results': results,
-        'message': 'All status updates sent. Check thread in #shopify-slack'
-    })
 
-@app.route('/test-specific/<order_number>/<status_type>/<status>', methods=['GET'])
-def test_specific(order_number, status_type, status):
-    """Test specific status update"""
-    details = {}
-    
-    if status_type == 'payment':
-        details = {'Amount': '$149.99', 'Method': 'Credit Card'}
-    elif status_type == 'fulfillment':
-        if status == 'fulfilled':
-            details = {'Tracking': 'ABC123XYZ', 'Carrier': 'DHL'}
-        elif status == 'in_progress':
-            details = {'Note': 'Processing in warehouse'}
-    
-    # First ensure order exists
-    if order_number not in order_threads:
-        test_data = {
-            'order_number': order_number,
-            'customer': {'name': 'Test Customer', 'phone': '+971501234567'},
-            'line_items': [{'name': 'Test Item', 'quantity': 1}]
-        }
-        send_order_notification(test_data)
-    
-    success = send_status_update(order_number, status_type, status, details)
-    
-    if success:
+@app.route('/test-webhook', methods=['POST', 'GET'])
+def test_webhook():
+    """Test endpoint to simulate Shopify webhook"""
+    # Simulate "created" parent message
+    success_created = send_to_slack(
+        order_number='TEST-001',
+        status='created',
+        customer_name='Test Customer',
+        amount='149.99',
+        customer_email='test@example.com',
+        phone='0500000000',
+        item_name='Demo Perfume 100ml',
+        quantity=1
+    )
+
+    # Simulate a later "paid" update in same thread
+    success_paid = send_to_slack(
+        order_number='TEST-001',
+        status='paid',
+        customer_name='Test Customer',
+        amount='149.99',
+        customer_email='test@example.com',
+        phone='0500000000',
+        item_name='Demo Perfume 100ml',
+        quantity=1
+    )
+
+    if success_created and success_paid:
         return jsonify({
             'success': True,
-            'order': order_number,
-            'status_type': status_type,
-            'status': status,
-            'message': f'{status_type} update sent for order #{order_number}'
-        })
-    
-    return jsonify({'error': 'Failed'}), 500
+            'message': 'Test messages sent. Check #shopify-slack channel.'
+        }), 200
+    else:
+        return jsonify({'error': 'Test failed'}), 500
+
+
+@app.route('/debug', methods=['GET'])
+def debug():
+    """Debug endpoint"""
+    return jsonify({
+        'status': 'running',
+        'channel_id': SLACK_CHANNEL_ID,
+        'tracked_orders': list(order_threads.keys()),
+        'webhook_url': 'https://slack-reply.onrender.com/webhook/shopify'
+    })
+
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'healthy'}), 200
+
 
 @app.route('/', methods=['GET'])
 def home():
     return '''
     <html>
         <body style="font-family: Arial, sans-serif; padding: 20px;">
-            <h1>✅ Shopify → Slack (Payment & Fulfillment Status)</h1>
+            <h1>✅ Shopify to Slack Webhook</h1>
+            <p><strong>Status:</strong> Running</p>
+            <p><strong>Webhook URL:</strong> https://slack-reply.onrender.com/webhook/shopify</p>
+            <p><strong>Slack Channel:</strong> #shopify-slack</p>
             <hr>
-            <h3>Payment Status:</h3>
+            <h3>Endpoints:</h3>
             <ul>
-                <li>⏳ Payment Pending</li>
-                <li>✅ Payment Received</li>
-                <li>🔒 Payment Authorized</li>
-                <li>↩️ Refund Processed</li>
-                <li>❌ Payment Voided</li>
-            </ul>
-            
-            <h3>Fulfillment Status:</h3>
-            <ul>
-                <li>📦 Order Not Fulfilled</li>
-                <li>⚙️ Fulfillment In Progress</li>
-                <li>⏸️ Fulfillment On Hold</li>
-                <li>📤 Partially Fulfilled</li>
-                <li>🚀 Order Fulfilled</li>
-            </ul>
-            <hr>
-            <h3>Test Endpoints:</h3>
-            <ul>
-                <li><a href="/test-all-statuses">/test-all-statuses</a> - Test ALL statuses</li>
-                <li><a href="/test-specific/TEST123/payment/paid">/test-specific/ORDER/STATUS_TYPE/STATUS</a> - Test specific</li>
                 <li><a href="/health">/health</a> - Health check</li>
+                <li><a href="/debug">/debug</a> - Debug info</li>
+                <li><a href="/test-webhook">/test-webhook</a> - Test webhook</li>
+                <li><strong>/webhook/shopify</strong> - Shopify webhook endpoint (POST only)</li>
             </ul>
+            <hr>
+            <h3>For Shopify Setup:</h3>
+            <ol>
+                <li>Create webhook in Shopify</li>
+                <li>URL: <code>https://slack-reply.onrender.com/webhook/shopify</code></li>
+                <li>Events: "Order creation" and "Order update"</li>
+            </ol>
         </body>
     </html>
     '''
