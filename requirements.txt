@@ -1,0 +1,4 @@
+flask
+slack_sdk
+python-dotenv
+gunicorn
