@@ -14,7 +14,8 @@ CONVERSATIONS_HISTORY_LIMIT = int(os.getenv('CONVERSATIONS_HISTORY_LIMIT', "200"
 if not SLACK_BOT_TOKEN:
     app.logger.warning("No SLACK_BOT_TOKEN configured. Set SLACK_BOT_TOKEN in environment variables.")
 
-# In-memory store for order -> thread_ts mapping (ephemeral)
+# In-memory store for order -> thread mapping and last-known statuses
+# Structure: order_threads[order_number] = {"ts": "...", "channel": "...", "last_payment": "...", "last_fulfillment": "..."}
 order_threads = {}
 
 def normalize_text(s: str) -> str:
@@ -52,8 +53,6 @@ def find_message_ts_for_order(order_number, channel_id=SLACK_CHANNEL_ID):
         messages = data.get("messages", [])
         onum = str(order_number).lstrip("#").strip()  # canonical digits/text
 
-        # needles to check; we will also check combined conditions (e.g., 'st.order' present AND order number present)
-        # include lower-case forms
         needles = [
             f"st.order #{onum}",
             f"st.order {onum}",
@@ -67,25 +66,19 @@ def find_message_ts_for_order(order_number, channel_id=SLACK_CHANNEL_ID):
             raw_text = msg.get("text", "") or ""
             text = normalize_text(raw_text)
 
-            # Quick wins: if 'st.order' + order number both present
             if "st.order" in text and onum in text:
                 ts = msg.get("ts")
                 app.logger.info("Found ST.order style message for order %s ts=%s", order_number, ts)
                 return ts
 
-            # Otherwise try the needles in order
             for needle in needles:
                 if needle in text:
-                    # To reduce false positives when matching plain number (e.g. '1273'),
-                    # require that either the needle includes a prefix (# or order) or the message also contains 'order' / 'st.order'
                     if needle == onum:
-                        # plain number match: only accept if message also contains 'order' or 'st.order'
                         if ("order " in text) or ("st.order" in text) or (f"#{onum}" in text):
                             ts = msg.get("ts")
                             app.logger.info("Found message for order %s (plain-number match) ts=%s", order_number, ts)
                             return ts
                         else:
-                            # skip this plain numeric match as likely false positive
                             continue
                     else:
                         ts = msg.get("ts")
@@ -100,10 +93,21 @@ def find_message_ts_for_order(order_number, channel_id=SLACK_CHANNEL_ID):
         app.logger.exception("Error while searching for order message: %s", str(e))
         return None
 
-def save_mapping(order_number, thread_ts, channel=SLACK_CHANNEL_ID):
-    if order_number and thread_ts:
-        order_threads[str(order_number)] = {"ts": thread_ts, "channel": channel}
-        app.logger.info("Saved mapping for order %s -> %s@%s", order_number, thread_ts, channel)
+def save_mapping(order_number, thread_ts, channel=SLACK_CHANNEL_ID, last_payment=None, last_fulfillment=None):
+    # If mapping already exists preserve existing last-known values unless overridden
+    current = order_threads.get(str(order_number), {})
+    order_threads[str(order_number)] = {
+        "ts": thread_ts,
+        "channel": channel,
+        "last_payment": last_payment if last_payment is not None else current.get("last_payment"),
+        "last_fulfillment": last_fulfillment if last_fulfillment is not None else current.get("last_fulfillment")
+    }
+    app.logger.info("Saved mapping for order %s -> %s@%s (payment=%s, fulfillment=%s)",
+                    order_number,
+                    thread_ts,
+                    channel,
+                    order_threads[str(order_number)].get("last_payment"),
+                    order_threads[str(order_number)].get("last_fulfillment"))
 
 def get_mapping(order_number):
     return order_threads.get(str(order_number))
@@ -144,6 +148,7 @@ def ensure_thread_for_order(order_number, channel_id=SLACK_CHANNEL_ID):
 
     ts = find_message_ts_for_order(order_number, channel_id=channel_id)
     if ts:
+        # Save mapping; last statuses remain None until we update them
         save_mapping(order_number, ts, channel=channel_id)
         return get_mapping(order_number)
 
@@ -219,23 +224,36 @@ def shopify_webhook():
                 app.logger.warning("No Slack message found for order %s yet. Will wait for a copy into channel.", order_number)
                 return jsonify({'ok': False, 'reason': 'no slack message found for order yet'}), 202
 
-            if financial_status:
+            # Get last-known statuses
+            last_payment = mapping.get("last_payment")
+            last_fulfillment = mapping.get("last_fulfillment")
+
+            # PAYMENT: only post if payment_status is present and different from last_payment
+            if payment_status and (str(payment_status) != str(last_payment)):
+                # We intentionally do NOT include amount
                 details = {}
-                if total_price:
-                    details['Amount'] = f"${total_price}"
                 if data.get('gateway'):
                     details['Method'] = data.get('gateway')
                 text = create_status_text('payment', payment_status, details)
-                post_thread_message(mapping['channel'], mapping['ts'], text)
+                posted = post_thread_message(mapping['channel'], mapping['ts'], text)
+                if posted:
+                    # update stored last payment
+                    mapping['last_payment'] = payment_status
+                    save_mapping(order_number, mapping['ts'], channel=mapping['channel'], last_payment=payment_status, last_fulfillment=mapping.get('last_fulfillment'))
 
-            if fulfillment_status:
+            # FULFILLMENT: only post if fulfillment_status is present and different from last_fulfillment
+            if fulfillment_status and (str(fulfillment_status_mapped) != str(last_fulfillment)):
                 fdetails = {}
                 if data.get('tracking_numbers'):
                     fdetails['Tracking'] = ', '.join(data.get('tracking_numbers', []))
                 if data.get('tracking_company'):
                     fdetails['Carrier'] = data.get('tracking_company')
                 text2 = create_status_text('fulfillment', fulfillment_status_mapped, fdetails)
-                post_thread_message(mapping['channel'], mapping['ts'], text2)
+                posted2 = post_thread_message(mapping['channel'], mapping['ts'], text2)
+                if posted2:
+                    # update stored last fulfillment
+                    mapping['last_fulfillment'] = fulfillment_status_mapped
+                    save_mapping(order_number, mapping['ts'], channel=mapping['channel'], last_payment=mapping.get('last_payment'), last_fulfillment=fulfillment_status_mapped)
 
             return jsonify({'ok': True, 'order': order_number}), 200
 
