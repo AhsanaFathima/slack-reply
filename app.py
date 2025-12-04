@@ -60,31 +60,29 @@ def post_slack_reply(thread_ts, text):
     except Exception:
         return False
 
-def create_status_message(status_type, status):
-    """Create status message text"""
-    
+def get_payment_status_text(status):
+    """Get payment status text"""
     status_map = {
-        'payment': {
-            'payment pending': '⏳ Payment Pending',
-            'paid': '✅ Payment Paid',
-            'refunded': '↩️ Payment Refunded',
-            'voided': '❌ Payment Voided',
-            'authorized': '🔒 Payment Authorized',
-        },
-        'fulfillment': {
-            'fulfilled': '🚀 Fulfilled',
-            'partially fulfilled': '📤 Partially Fulfilled',
-            'on hold': '⏸️ On Hold',
-            'in progress': '⚙️ In Progress',
-            'unfulfilled': '📦 Unfulfilled',
-        }
+        'payment pending': '⏳ Payment Pending',
+        'paid': '✅ Payment Paid',
+        'refunded': '↩️ Payment Refunded',
+        'voided': '❌ Payment Voided',
+        'authorized': '🔒 Payment Authorized',
     }
-    
     status_lower = str(status).lower()
-    status_text = status_map[status_type].get(status_lower, f'📝 {status}')
-    
-    time_now = datetime.now().strftime("%I:%M %p")
-    return f"{status_text} • {time_now}"
+    return status_map.get(status_lower, f'💳 {status}')
+
+def get_fulfillment_status_text(status):
+    """Get fulfillment status text"""
+    status_map = {
+        'fulfilled': '🚀 Fulfilled',
+        'partially fulfilled': '📤 Partially Fulfilled',
+        'on hold': '⏸️ On Hold',
+        'in progress': '⚙️ In Progress',
+        'unfulfilled': '📦 Unfulfilled',
+    }
+    status_lower = str(status).lower()
+    return status_map.get(status_lower, f'📦 {status}')
 
 @app.route('/webhook/shopify', methods=['POST'])
 def shopify_webhook():
@@ -141,15 +139,22 @@ def shopify_webhook():
         
         mapping = order_threads[clean_order]
         
-        # Check and post payment update
+        # Get current time
+        time_now = datetime.now().strftime("%I:%M %p")
+        
+        # Check and post payment update (ONLY IF CHANGED)
         if payment_status and payment_status != mapping.get('last_payment'):
-            message = create_status_message('payment', payment_status)
+            status_text = get_payment_status_text(payment_status)
+            message = f"{status_text} • {time_now}"
+            
             if post_slack_reply(mapping['ts'], message):
                 mapping['last_payment'] = payment_status
         
-        # Check and post fulfillment update
+        # Check and post fulfillment update (ONLY IF CHANGED)
         if fulfillment_status_mapped and fulfillment_status_mapped != mapping.get('last_fulfillment'):
-            message = create_status_message('fulfillment', fulfillment_status_mapped)
+            status_text = get_fulfillment_status_text(fulfillment_status_mapped)
+            message = f"{status_text} • {time_now}"
+            
             if post_slack_reply(mapping['ts'], message):
                 mapping['last_fulfillment'] = fulfillment_status_mapped
         
@@ -166,6 +171,34 @@ def test_order(order_number):
         return jsonify({'found': True, 'order': order_number}), 200
     return jsonify({'found': False, 'order': order_number}), 404
 
+@app.route('/test-payment/<order_number>/<status>', methods=['GET'])
+def test_payment(order_number, status):
+    """Test payment status update"""
+    ts = find_order_message(order_number)
+    if not ts:
+        return jsonify({'found': False}), 404
+    
+    time_now = datetime.now().strftime("%I:%M %p")
+    status_text = get_payment_status_text(status)
+    message = f"{status_text} • {time_now}"
+    
+    success = post_slack_reply(ts, message)
+    return jsonify({'ok': success, 'message': message})
+
+@app.route('/test-fulfillment/<order_number>/<status>', methods=['GET'])
+def test_fulfillment(order_number, status):
+    """Test fulfillment status update"""
+    ts = find_order_message(order_number)
+    if not ts:
+        return jsonify({'found': False}), 404
+    
+    time_now = datetime.now().strftime("%I:%M %p")
+    status_text = get_fulfillment_status_text(status)
+    message = f"{status_text} • {time_now}"
+    
+    success = post_slack_reply(ts, message)
+    return jsonify({'ok': success, 'message': message})
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
@@ -178,9 +211,17 @@ def health():
 def home():
     return """
     <h2>Shopify Slack Status</h2>
-    <p>Posts order status updates to Slack thread</p>
+    <p>Posts SEPARATE status updates to Slack thread</p>
     <p>Orders tracked: {}</p>
-    <p><a href="/health">Health</a> | <a href="/test/1278">Test Order 1278</a></p>
+    <p><strong>Format:</strong> Single line per status change</p>
+    <p><strong>Example:</strong> ✅ Payment Paid • 02:00 PM</p>
+    <p><strong>Example:</strong> 🚀 Fulfilled • 02:03 PM</p>
+    <p>
+        <a href="/health">Health</a> | 
+        <a href="/test/1278">Test Order</a> |
+        <a href="/test-payment/1278/paid">Test Payment</a> |
+        <a href="/test-fulfillment/1278/fulfilled">Test Fulfillment</a>
+    </p>
     """.format(len(order_threads))
 
 if __name__ == '__main__':
