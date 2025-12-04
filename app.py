@@ -1,4 +1,4 @@
-# app.py (optimized for your order format)
+# app.py (FIXED - no formatting error)
 import os
 import requests
 from flask import Flask, request, jsonify
@@ -399,10 +399,6 @@ def test_webhook():
         }
     }
     
-    # Create a fake request
-    from flask import request
-    request._cached_json = test_data
-    
     return jsonify({
         'message': 'Test webhook processed',
         'data': test_data,
@@ -421,18 +417,19 @@ def health():
 
 @app.route('/', methods=['GET'])
 def home():
-    return """
+    """Simple home page without formatting issues"""
+    return f"""
     <html>
     <head>
         <title>Shopify → Slack Status Updater</title>
         <style>
-            body { font-family: Arial, sans-serif; padding: 30px; max-width: 800px; margin: 0 auto; }
-            .card { background: #f8f9fa; padding: 25px; border-radius: 10px; margin: 20px 0; border-left: 5px solid #4CAF50; }
-            .success { color: #4CAF50; }
-            .warning { color: #ff9800; }
-            .error { color: #f44336; }
-            .emoji { font-size: 24px; }
-            code { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; }
+            body {{ font-family: Arial, sans-serif; padding: 30px; max-width: 800px; margin: 0 auto; }}
+            .card {{ background: #f8f9fa; padding: 25px; border-radius: 10px; margin: 20px 0; border-left: 5px solid #4CAF50; }}
+            .success {{ color: #4CAF50; }}
+            .warning {{ color: #ff9800; }}
+            .error {{ color: #f44336; }}
+            .emoji {{ font-size: 24px; }}
+            code {{ background: #e8e8e8; padding: 2px 6px; border-radius: 3px; }}
         </style>
     </head>
     <body>
@@ -440,7 +437,7 @@ def home():
         
         <div class="card">
             <h2>📍 Working ONLY in: <code>shopify-slack</code> channel</h2>
-            <p><strong>Channel ID:</strong> <code>{channel_id}</code></p>
+            <p><strong>Channel ID:</strong> <code>{SHOPIFY_SLACK_CHANNEL_ID}</code></p>
         </div>
         
         <div class="card">
@@ -456,7 +453,7 @@ def home():
         <div class="card">
             <h2>📊 Current Status</h2>
             <p class="emoji">✅ <strong>Service is running</strong></p>
-            <p>📈 <strong>Orders being tracked:</strong> {count}</p>
+            <p>📈 <strong>Orders being tracked:</strong> {len(order_threads)}</p>
             <p>🔗 <strong>Shopify Webhooks:</strong> Configured for status updates</p>
         </div>
         
@@ -478,7 +475,7 @@ def home():
         </div>
     </body>
     </html>
-    """.format(count=len(order_threads), channel_id=SHOPIFY_SLACK_CHANNEL_ID)
+    """
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
