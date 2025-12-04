@@ -1,3 +1,4 @@
+# app.py
 import os
 import requests
 from flask import Flask, request, jsonify
@@ -5,139 +6,150 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# Configuration
-SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN')
-SLACK_CHANNEL_ID = "C0A068PHZMY"  # Your #shopify-slack channel
+# Configuration - set these in Render env vars
+SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN')            # xoxb-...
+SLACK_CHANNEL_ID = os.getenv('SLACK_CHANNEL_ID', 'C0A068PHZMY')  # channel where copied messages appear (#shopify-slack)
+CONVERSATIONS_HISTORY_LIMIT = int(os.getenv('CONVERSATIONS_HISTORY_LIMIT', "200"))
 
-# Store thread timestamps {order_number: thread_ts}
+if not SLACK_BOT_TOKEN:
+    app.logger.warning("No SLACK_BOT_TOKEN configured. Set SLACK_BOT_TOKEN in environment variables.")
+
+# In-memory store for order -> thread_ts mapping (ephemeral)
 order_threads = {}
 
-def format_phone(phone):
-    """Format phone number"""
-    if not phone:
-        return "N/A"
-    try:
-        phone = str(phone)
-        phone = ''.join(filter(str.isdigit, phone))
-        if phone.startswith('971') and len(phone) == 12:
-            return f"+{phone[:3]} {phone[3:]}"
-        return phone
-    except:
-        return "N/A"
+def normalize_text(s: str) -> str:
+    """Lowercase and normalize whitespace for safer substring checks."""
+    if not s:
+        return ""
+    return " ".join(str(s).lower().split())
 
-def truncate_text(text, max_length=15):
-    """Truncate text for horizontal display"""
-    if not text:
-        return "N/A"
-    text = str(text)
-    if len(text) <= max_length:
-        return text
-    return text[:max_length-2] + ".."
-
-def create_horizontal_table(order_data):
-    """Create HORIZONTAL table format (single line)"""
-    try:
-        order_number = order_data.get('order_number') or order_data.get('name', 'N/A')
-        customer = order_data.get('customer', {})
-        customer_name = customer.get('name', 'Customer')
-        phone = format_phone(customer.get('phone', 'N/A'))
-        
-        # Get first item only
-        line_items = order_data.get('line_items', [])
-        item_info = "N/A"
-        quantity = "N/A"
-        
-        if line_items:
-            first_item = line_items[0]
-            item_name = first_item.get('name', 'Item')
-            variant = first_item.get('variant_title', '')
-            item_info = f"{item_name}"
-            if variant:
-                item_info += f" {variant}"
-            quantity = str(first_item.get('quantity', 1))
-        
-        # Truncate for horizontal display
-        order_display = truncate_text(order_number, 18)
-        customer_display = truncate_text(customer_name, 18)
-        phone_display = truncate_text(phone, 17)
-        item_display = truncate_text(item_info, 25)
-        quantity_display = truncate_text(quantity, 8)
-        
-        # Create HORIZONTAL table (single line)
-        message = "📦 *NEW ORDER*\n"
-        message += "┌──────────┬────────────┬────────────┬────────────────────┬───────┐\n"
-        message +=f"│ Order #  │ Customer   │ Phone      │ Item               │ Qty   │\n"
-        message += "├──────────┼────────────┼────────────┼────────────────────┼───────┤\n"
-        message +=f"│ {order_display:<8} │ {customer_display:<10} │ {phone_display:<10} │ {item_display:<18} │ {quantity_display:<5} │\n"
-        message += "└──────────┴────────────┴────────────┴────────────────────┴───────┘"
-        
-        return message
-    except Exception as e:
-        print(f"❌ Error creating table: {e}")
-        return "📦 *NEW ORDER*\nError creating table"
-
-def send_order_notification(order_data):
-    """Send order notification in HORIZONTAL table format"""
+def find_message_ts_for_order(order_number, channel_id=SLACK_CHANNEL_ID):
+    """
+    Search recent messages in the given channel for the order_number in several common formats.
+    Returns the ts if found, otherwise None.
+    """
     if not SLACK_BOT_TOKEN:
-        print("❌ No Slack bot token configured")
+        app.logger.error("Cannot search Slack: SLACK_BOT_TOKEN not set")
         return None
-    
+
+    url = "https://slack.com/api/conversations.history"
     headers = {
-        'Authorization': f'Bearer {SLACK_BOT_TOKEN}',
-        'Content-Type': 'application/json'
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json"
     }
-    
+    params = {
+        "channel": channel_id,
+        "limit": CONVERSATIONS_HISTORY_LIMIT
+    }
+
     try:
-        order_number = order_data.get('order_number') or order_data.get('name', 'N/A')
-        message_text = create_horizontal_table(order_data)
-        
-        print(f"📤 Sending order #{order_number} to Slack...")
-        
-        # Send the order notification
-        message = {
-            'channel': SLACK_CHANNEL_ID,
-            'text': message_text
-        }
-        
-        response = requests.post(
-            'https://slack.com/api/chat.postMessage',
-            headers=headers,
-            json=message,
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('ok'):
-                thread_ts = result['ts']
-                order_threads[order_number] = thread_ts
-                print(f"✅ Order #{order_number} notification sent")
-                return thread_ts
-            else:
-                print(f"❌ Slack error: {result.get('error')}")
-                
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        data = resp.json()
+        if not data.get("ok"):
+            app.logger.error("Slack API error searching conversations.history: %s", data.get("error"))
+            return None
+
+        messages = data.get("messages", [])
+        onum = str(order_number).lstrip("#").strip()  # canonical digits/text
+
+        # needles to check; we will also check combined conditions (e.g., 'st.order' present AND order number present)
+        # include lower-case forms
+        needles = [
+            f"st.order #{onum}",
+            f"st.order {onum}",
+            f"order #{onum}",
+            f"order {onum}",
+            f"#{onum}",
+            f"{onum}"
+        ]
+
+        for msg in messages:
+            raw_text = msg.get("text", "") or ""
+            text = normalize_text(raw_text)
+
+            # Quick wins: if 'st.order' + order number both present
+            if "st.order" in text and onum in text:
+                ts = msg.get("ts")
+                app.logger.info("Found ST.order style message for order %s ts=%s", order_number, ts)
+                return ts
+
+            # Otherwise try the needles in order
+            for needle in needles:
+                if needle in text:
+                    # To reduce false positives when matching plain number (e.g. '1273'),
+                    # require that either the needle includes a prefix (# or order) or the message also contains 'order' / 'st.order'
+                    if needle == onum:
+                        # plain number match: only accept if message also contains 'order' or 'st.order'
+                        if ("order " in text) or ("st.order" in text) or (f"#{onum}" in text):
+                            ts = msg.get("ts")
+                            app.logger.info("Found message for order %s (plain-number match) ts=%s", order_number, ts)
+                            return ts
+                        else:
+                            # skip this plain numeric match as likely false positive
+                            continue
+                    else:
+                        ts = msg.get("ts")
+                        app.logger.info("Found message for order %s matching needle '%s' ts=%s", order_number, needle, ts)
+                        return ts
+
+        app.logger.info("No message found for order %s in channel %s (checked %d messages)",
+                        order_number, channel_id, len(messages))
+        return None
+
     except Exception as e:
-        print(f"❌ Error sending to Slack: {e}")
-    
+        app.logger.exception("Error while searching for order message: %s", str(e))
+        return None
+
+def save_mapping(order_number, thread_ts, channel=SLACK_CHANNEL_ID):
+    if order_number and thread_ts:
+        order_threads[str(order_number)] = {"ts": thread_ts, "channel": channel}
+        app.logger.info("Saved mapping for order %s -> %s@%s", order_number, thread_ts, channel)
+
+def get_mapping(order_number):
+    return order_threads.get(str(order_number))
+
+def post_thread_message(channel, thread_ts, text):
+    """Post a message into a thread using chat.postMessage"""
+    if not SLACK_BOT_TOKEN:
+        app.logger.error("No SLACK_BOT_TOKEN configured")
+        return False
+
+    url = "https://slack.com/api/chat.postMessage"
+    headers = {
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "channel": channel,
+        "thread_ts": thread_ts,
+        "text": text
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        data = resp.json()
+        if data.get("ok"):
+            app.logger.info("Posted thread message to %s (ts=%s)", channel, thread_ts)
+            return True
+        else:
+            app.logger.error("Slack chat.postMessage error: %s", data.get("error"))
+            return False
+    except Exception as e:
+        app.logger.exception("Error posting thread message: %s", str(e))
+        return False
+
+def ensure_thread_for_order(order_number, channel_id=SLACK_CHANNEL_ID):
+    mapping = get_mapping(order_number)
+    if mapping:
+        return mapping
+
+    ts = find_message_ts_for_order(order_number, channel_id=channel_id)
+    if ts:
+        save_mapping(order_number, ts, channel=channel_id)
+        return get_mapping(order_number)
+
     return None
 
-def send_status_update(order_number, status_type, status, details=None):
-    """Send status update as threaded reply"""
-    if not SLACK_BOT_TOKEN:
-        print("❌ No Slack bot token configured")
-        return False
-    
-    if order_number not in order_threads:
-        print(f"❌ Order #{order_number} not found in threads")
-        return False
-    
-    thread_ts = order_threads[order_number]
-    headers = {
-        'Authorization': f'Bearer {SLACK_BOT_TOKEN}',
-        'Content-Type': 'application/json'
-    }
-    
-    # EXACT STATUS NAMES as specified
+def create_status_text(status_type, status, details=None):
     payment_status = {
         'paid': {'emoji': '✅', 'text': 'Payment Paid'},
         'payment pending': {'emoji': '⏳', 'text': 'Payment Pending'},
@@ -145,7 +157,7 @@ def send_status_update(order_number, status_type, status, details=None):
         'refunded': {'emoji': '↩️', 'text': 'Payment Refunded'},
         'voided': {'emoji': '❌', 'text': 'Payment Voided'},
     }
-    
+
     fulfillment_status = {
         'fulfilled': {'emoji': '🚀', 'text': 'Fulfilled'},
         'unfulfilled': {'emoji': '📦', 'text': 'Unfulfilled'},
@@ -153,205 +165,89 @@ def send_status_update(order_number, status_type, status, details=None):
         'in progress': {'emoji': '⚙️', 'text': 'In Progress'},
         'on hold': {'emoji': '⏸️', 'text': 'On Hold'},
     }
-    
-    try:
-        # Get config based on status type
-        if status_type == 'payment':
-            status_map = payment_status
-            prefix = '💳'
-        elif status_type == 'fulfillment':
-            status_map = fulfillment_status
-            prefix = '📦'
-        else:
-            status_map = {}
-            prefix = '📝'
-        
-        # Get exact status
-        if status:
-            status_lower = status.lower()
-            config = status_map.get(status_lower, {'emoji': '📝', 'text': status.title() if status else 'Unknown'})
-        else:
-            config = {'emoji': '❓', 'text': 'Unknown Status'}
-        
-        time_now = datetime.now().strftime("%I:%M %p")
-        
-        # Create message
-        message_text = f"{prefix} {config['emoji']} *{config['text']}* • {time_now}"
-        
-        # Add details if provided
-        if details:
-            for key, value in details.items():
-                if value:
-                    message_text += f"\n{key}: {value}"
-        
-        message = {
-            'channel': SLACK_CHANNEL_ID,
-            'thread_ts': thread_ts,
-            'text': message_text
-        }
-        
-        response = requests.post(
-            'https://slack.com/api/chat.postMessage',
-            headers=headers,
-            json=message,
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('ok'):
-                print(f"✅ {status_type.title()} update for #{order_number}: {status}")
-                return True
-            
-    except Exception as e:
-        print(f"❌ Error sending status update: {e}")
-    
-    return False
+
+    if status_type == 'payment':
+        status_map = payment_status
+        prefix = '💳'
+    elif status_type == 'fulfillment':
+        status_map = fulfillment_status
+        prefix = '📦'
+    else:
+        status_map = {}
+        prefix = '📝'
+
+    if status:
+        s = status.lower()
+        cfg = status_map.get(s, {'emoji': '📝', 'text': (status.title() if status else 'Unknown')})
+    else:
+        cfg = {'emoji': '❓', 'text': 'Unknown Status'}
+
+    time_now = datetime.now().strftime("%I:%M %p")
+    text = f"{prefix} {cfg['emoji']} *{cfg['text']}* • {time_now}"
+    if details:
+        for k, v in (details.items() if isinstance(details, dict) else []):
+            if v:
+                text += f"\n{k}: {v}"
+    return text
 
 @app.route('/webhook/shopify', methods=['POST'])
 def shopify_webhook():
-    """Handle Shopify webhooks"""
-    print("📩 Shopify webhook received")
-    
+    app.logger.info("📩 Shopify webhook received")
     try:
         data = request.get_json()
         if not data:
             return jsonify({'error': 'No data received'}), 400
-        
-        webhook_topic = request.headers.get('X-Shopify-Topic', 'Unknown')
-        
-        # Extract order info
-        order_number = data.get('order_number') or data.get('name') or f"ID-{data.get('id', 'unknown')}"
-        financial_status = data.get('financial_status', 'pending')
-        fulfillment_status = data.get('fulfillment_status', 'unfulfilled')
-        total_price = data.get('total_price', '0.00')
-        
-        # Map Shopify status to our exact status names
+
+        webhook_topic = request.headers.get('X-Shopify-Topic', 'unknown')
+        order_number = data.get('order_number') or data.get('name') or str(data.get('id', 'unknown'))
+        financial_status = data.get('financial_status') or data.get('payment_status') or ''
+        fulfillment_status = data.get('fulfillment_status') or ''
+        total_price = data.get('total_price') or data.get('total_price_set', {}).get('presentment_money', {}).get('amount')
+
         status_mapping = {
             'pending': 'payment pending',
             'partially_fulfilled': 'partially fulfilled',
             'partial': 'partially fulfilled'
         }
-        
-        payment_status = status_mapping.get(financial_status.lower() if financial_status else '', financial_status)
-        fulfillment_status_mapped = status_mapping.get(fulfillment_status.lower() if fulfillment_status else '', fulfillment_status)
-        
-        if webhook_topic == 'orders/create':
-            # New order - send notification
-            thread_ts = send_order_notification(data)
-            if thread_ts:
-                # Send initial payment status
-                send_status_update(
-                    order_number, 
-                    'payment',
-                    payment_status,
-                    {'Amount': f"${total_price}"}
-                )
-                return jsonify({'success': True, 'order': order_number}), 200
-        
-        elif webhook_topic == 'orders/updated':
-            # First, ensure we have a thread for this order
-            if order_number not in order_threads:
-                send_order_notification(data)
-            
-            # Check if payment status changed
-            if financial_status and financial_status != 'pending':
-                details = {'Amount': f"${total_price}"}
+        payment_status = status_mapping.get((financial_status or '').lower(), financial_status)
+        fulfillment_status_mapped = status_mapping.get((fulfillment_status or '').lower(), fulfillment_status)
+
+        # Only handle updates (we do NOT create initial message here)
+        if webhook_topic in ('orders/updated', 'orders/paid', 'fulfillments/create', 'fulfillments/update'):
+            mapping = ensure_thread_for_order(order_number)
+            if not mapping:
+                app.logger.warning("No Slack message found for order %s yet. Will wait for a copy into channel.", order_number)
+                return jsonify({'ok': False, 'reason': 'no slack message found for order yet'}), 202
+
+            if financial_status:
+                details = {}
+                if total_price:
+                    details['Amount'] = f"${total_price}"
                 if data.get('gateway'):
                     details['Method'] = data.get('gateway')
-                
-                send_status_update(
-                    order_number,
-                    'payment',
-                    payment_status,
-                    details
-                )
-            
-            # Check if fulfillment status changed
-            if fulfillment_status and fulfillment_status != 'unfulfilled':
-                fulfillment_details = {}
+                text = create_status_text('payment', payment_status, details)
+                post_thread_message(mapping['channel'], mapping['ts'], text)
+
+            if fulfillment_status:
+                fdetails = {}
                 if data.get('tracking_numbers'):
-                    fulfillment_details['Tracking'] = ', '.join(data.get('tracking_numbers', []))
+                    fdetails['Tracking'] = ', '.join(data.get('tracking_numbers', []))
                 if data.get('tracking_company'):
-                    fulfillment_details['Carrier'] = data.get('tracking_company')
-                
-                send_status_update(
-                    order_number,
-                    'fulfillment',
-                    fulfillment_status_mapped,
-                    fulfillment_details
-                )
-            
-            return jsonify({'success': True, 'order': order_number}), 200
-        
-        return jsonify({'success': True}), 200
-        
+                    fdetails['Carrier'] = data.get('tracking_company')
+                text2 = create_status_text('fulfillment', fulfillment_status_mapped, fdetails)
+                post_thread_message(mapping['channel'], mapping['ts'], text2)
+
+            return jsonify({'ok': True, 'order': order_number}), 200
+
+        if webhook_topic == 'orders/create':
+            app.logger.info("Received orders/create for %s: doing nothing (Flow handles creation).", order_number)
+            return jsonify({'ok': True, 'note': 'creation handled by Flow/Incoming Webhook'}), 200
+
+        return jsonify({'ok': True}), 200
+
     except Exception as e:
-        print(f"❌ ERROR in webhook handler: {str(e)}")
-        return jsonify({'error': str(e)}), 400
-
-@app.route('/test-horizontal', methods=['GET'])
-def test_horizontal():
-    """Test HORIZONTAL table format"""
-    test_data = {
-        'order_number': '1257',
-        'customer': {
-            'name': 'Ahsana',
-            'phone': '+971545982212'
-        },
-        'total_price': '149.99',
-        'line_items': [
-            {
-                'name': 'Ahmed Al Maghribi Bidun Esam 12 ml',
-                'variant_title': 'CPO Unisex Perfume',
-                'quantity': 1
-            }
-        ]
-    }
-    
-    thread_ts = send_order_notification(test_data)
-    
-    if thread_ts:
-        # Send test updates
-        send_status_update(test_data['order_number'], 'payment', 'payment pending', {'Amount': '$149.99'})
-        send_status_update(test_data['order_number'], 'payment', 'paid', {'Amount': '$149.99', 'Method': 'Credit Card'})
-        
-        return jsonify({
-            'success': True,
-            'order': test_data['order_number'],
-            'message': 'HORIZONTAL table sent. Check #shopify-slack!'
-        })
-    
-    return jsonify({'error': 'Failed to send'}), 500
-
-@app.route('/test-multiple', methods=['GET'])
-def test_multiple():
-    """Test with longer item name"""
-    test_data = {
-        'order_number': '1258',
-        'customer': {
-            'name': 'John Smith',
-            'phone': '+971501234567'
-        },
-        'line_items': [
-            {
-                'name': 'Abercrombie & Fitch Authentic Night 100 ml EDP Women Perfume Long Name Test',
-                'variant_title': 'Premium Edition',
-                'quantity': 2
-            }
-        ]
-    }
-    
-    thread_ts = send_order_notification(test_data)
-    
-    if thread_ts:
-        return jsonify({
-            'success': True,
-            'order': test_data['order_number'],
-            'note': 'Long item name truncated in horizontal table'
-        })
-    
-    return jsonify({'error': 'Failed'}), 500
+        app.logger.exception("❌ ERROR in webhook handler: %s", str(e))
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -359,26 +255,16 @@ def health():
 
 @app.route('/', methods=['GET'])
 def home():
-    return '''
-    <html>
-        <body style="font-family: Arial, sans-serif; padding: 20px;">
-            <h1>✅ Shopify → Slack (Horizontal Table)</h1>
-            <p><strong>Horizontal Table Format:</strong></p>
-            <pre style="background: #f5f5f5; padding: 10px; border-radius: 5px;">
-📦 NEW ORDER
-┌──────────┬────────────┬────────────┬────────────────────┬───────┐
-│ Order #  │ Customer   │ Phone      │ Item               │ Qty   │
-├──────────┼────────────┼────────────┼────────────────────┼───────┤
-│ 1257     │ Ahsana     │ +971 5459..│ Ahmed Al Maghribi..│ 1     │
-└──────────┴────────────┴────────────┴────────────────────┴───────┘
-            </pre>
-            <hr>
-            <p><a href="/test-horizontal">/test-horizontal</a> - Test horizontal table</p>
-            <p><a href="/test-multiple">/test-multiple</a> - Test with long item name</p>
-            <p><a href="/health">/health</a> - Health check</p>
-        </body>
-    </html>
-    '''
+    return """
+    <html><body>
+      <h2>Shopify → Slack status updater</h2>
+      <p>This service posts payment/fulfillment status updates as thread replies under the message
+      that contains the order number in the configured Slack channel.</p>
+      <p>Environment variables required: <code>SLACK_BOT_TOKEN</code> and <code>SLACK_CHANNEL_ID</code>.</p>
+      <p>Set <code>SLACK_CHANNEL_ID</code> to your <strong>#shopify-slack</strong> channel id.</p>
+      <p><small>Note: this app does not post the initial order creation message (Flow does that via incoming webhook).</small></p>
+    </body></html>
+    """
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
