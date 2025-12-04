@@ -57,9 +57,9 @@ def create_horizontal_table(order_data):
             quantity = str(first_item.get('quantity', 1))
         
         # Truncate for horizontal display
-        order_display = truncate_text(order_number, 10)
-        customer_display = truncate_text(customer_name, 12)
-        phone_display = truncate_text(phone, 12)
+        order_display = truncate_text(order_number, 12)
+        customer_display = truncate_text(customer_name, 14)
+        phone_display = truncate_text(phone, 14)
         item_display = truncate_text(item_info, 20)
         quantity_display = truncate_text(quantity, 5)
         
