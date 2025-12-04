@@ -25,17 +25,17 @@ def format_phone(phone):
     except:
         return "N/A"
 
-def truncate_text(text, max_length=20):
-    """Truncate text if too long for table"""
+def truncate_text(text, max_length=15):
+    """Truncate text for horizontal display"""
     if not text:
-        return ""
+        return "N/A"
     text = str(text)
     if len(text) <= max_length:
         return text
-    return text[:max_length-3] + "..."
+    return text[:max_length-2] + ".."
 
-def create_proper_table(order_data):
-    """Create PROPER table format"""
+def create_horizontal_table(order_data):
+    """Create HORIZONTAL table format (single line)"""
     try:
         order_number = order_data.get('order_number') or order_data.get('name', 'N/A')
         customer = order_data.get('customer', {})
@@ -56,22 +56,20 @@ def create_proper_table(order_data):
                 item_info += f" {variant}"
             quantity = str(first_item.get('quantity', 1))
         
-        # Truncate long text
-        order_display = truncate_text(order_number, 18)
-        customer_display = truncate_text(customer_name, 18)
-        phone_display = truncate_text(phone, 18)
-        item_display = truncate_text(item_info, 18)
-        quantity_display = truncate_text(quantity, 18)
+        # Truncate for horizontal display
+        order_display = truncate_text(order_number, 10)
+        customer_display = truncate_text(customer_name, 12)
+        phone_display = truncate_text(phone, 12)
+        item_display = truncate_text(item_info, 20)
+        quantity_display = truncate_text(quantity, 5)
         
-        # Create PROPER table format with box drawing
+        # Create HORIZONTAL table (single line)
         message = "📦 *NEW ORDER*\n"
-        message += "┌─────────────────────────────────────┐\n"
-        message += f"│ Order #:     {order_display:<18} │\n"
-        message += f"│ Customer:    {customer_display:<18} │\n"
-        message += f"│ Phone:       {phone_display:<18} │\n"
-        message += f"│ Item:        {item_display:<18} │\n"
-        message += f"│ Quantity:    {quantity_display:<18} │\n"
-        message += "└─────────────────────────────────────┘"
+        message += "┌──────────┬────────────┬────────────┬────────────────────┬───────┐\n"
+        message += f"│ Order #  │ Customer   │ Phone      │ Item               │ Qty   │\n"
+        message += "├──────────┼────────────┼────────────┼────────────────────┼───────┤\n"
+        message += f"│ {order_display:<8} │ {customer_display:<10} │ {phone_display:<10} │ {item_display:<18} │ {quantity_display:<5} │\n"
+        message += "└──────────┴────────────┴────────────┴────────────────────┴───────┘"
         
         return message
     except Exception as e:
@@ -79,7 +77,7 @@ def create_proper_table(order_data):
         return "📦 *NEW ORDER*\nError creating table"
 
 def send_order_notification(order_data):
-    """Send order notification in PROPER table format"""
+    """Send order notification in HORIZONTAL table format"""
     if not SLACK_BOT_TOKEN:
         print("❌ No Slack bot token configured")
         return None
@@ -91,10 +89,9 @@ def send_order_notification(order_data):
     
     try:
         order_number = order_data.get('order_number') or order_data.get('name', 'N/A')
-        message_text = create_proper_table(order_data)
+        message_text = create_horizontal_table(order_data)
         
         print(f"📤 Sending order #{order_number} to Slack...")
-        print(f"📋 Message preview:\n{message_text}")
         
         # Send the order notification
         message = {
@@ -109,11 +106,8 @@ def send_order_notification(order_data):
             timeout=10
         )
         
-        print(f"📡 Slack API response: {response.status_code}")
-        
         if response.status_code == 200:
             result = response.json()
-            
             if result.get('ok'):
                 thread_ts = result['ts']
                 order_threads[order_number] = thread_ts
@@ -121,9 +115,7 @@ def send_order_notification(order_data):
                 return thread_ts
             else:
                 print(f"❌ Slack error: {result.get('error')}")
-        else:
-            print(f"❌ HTTP error: {response.status_code}")
-            
+                
     except Exception as e:
         print(f"❌ Error sending to Slack: {e}")
     
@@ -174,7 +166,7 @@ def send_status_update(order_number, status_type, status, details=None):
             status_map = {}
             prefix = '📝'
         
-        # Get exact status (case-insensitive)
+        # Get exact status
         if status:
             status_lower = status.lower()
             config = status_map.get(status_lower, {'emoji': '📝', 'text': status.title() if status else 'Unknown'})
@@ -198,8 +190,6 @@ def send_status_update(order_number, status_type, status, details=None):
             'text': message_text
         }
         
-        print(f"📤 Sending status update for #{order_number}: {status}")
-        
         response = requests.post(
             'https://slack.com/api/chat.postMessage',
             headers=headers,
@@ -221,27 +211,20 @@ def send_status_update(order_number, status_type, status, details=None):
 @app.route('/webhook/shopify', methods=['POST'])
 def shopify_webhook():
     """Handle Shopify webhooks"""
-    print("=" * 50)
     print("📩 Shopify webhook received")
     
     try:
         data = request.get_json()
         if not data:
-            print("❌ No JSON data received")
             return jsonify({'error': 'No data received'}), 400
         
         webhook_topic = request.headers.get('X-Shopify-Topic', 'Unknown')
-        print(f"📦 Topic: {webhook_topic}")
         
-        # Extract order info with safe defaults
+        # Extract order info
         order_number = data.get('order_number') or data.get('name') or f"ID-{data.get('id', 'unknown')}"
         financial_status = data.get('financial_status', 'pending')
         fulfillment_status = data.get('fulfillment_status', 'unfulfilled')
         total_price = data.get('total_price', '0.00')
-        
-        print(f"📝 Order: #{order_number}")
-        print(f"💰 Payment: {financial_status}")
-        print(f"📦 Fulfillment: {fulfillment_status}")
         
         # Map Shopify status to our exact status names
         status_mapping = {
@@ -254,7 +237,6 @@ def shopify_webhook():
         fulfillment_status_mapped = status_mapping.get(fulfillment_status.lower() if fulfillment_status else '', fulfillment_status)
         
         if webhook_topic == 'orders/create':
-            print(f"🎉 New order created: #{order_number}")
             # New order - send notification
             thread_ts = send_order_notification(data)
             if thread_ts:
@@ -268,15 +250,12 @@ def shopify_webhook():
                 return jsonify({'success': True, 'order': order_number}), 200
         
         elif webhook_topic == 'orders/updated':
-            print(f"🔄 Order updated: #{order_number}")
             # First, ensure we have a thread for this order
             if order_number not in order_threads:
-                print(f"🔍 Creating new thread for order #{order_number}")
                 send_order_notification(data)
             
             # Check if payment status changed
             if financial_status and financial_status != 'pending':
-                print(f"💰 Payment status changed to: {financial_status}")
                 details = {'Amount': f"${total_price}"}
                 if data.get('gateway'):
                     details['Method'] = data.get('gateway')
@@ -290,7 +269,6 @@ def shopify_webhook():
             
             # Check if fulfillment status changed
             if fulfillment_status and fulfillment_status != 'unfulfilled':
-                print(f"📦 Fulfillment status changed to: {fulfillment_status}")
                 fulfillment_details = {}
                 if data.get('tracking_numbers'):
                     fulfillment_details['Tracking'] = ', '.join(data.get('tracking_numbers', []))
@@ -310,13 +288,11 @@ def shopify_webhook():
         
     except Exception as e:
         print(f"❌ ERROR in webhook handler: {str(e)}")
-        import traceback
-        print(f"🔍 Traceback: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 400
 
-@app.route('/test-table', methods=['GET'])
-def test_table():
-    """Test PROPER table format"""
+@app.route('/test-horizontal', methods=['GET'])
+def test_horizontal():
+    """Test HORIZONTAL table format"""
     test_data = {
         'order_number': '1257',
         'customer': {
@@ -339,16 +315,43 @@ def test_table():
         # Send test updates
         send_status_update(test_data['order_number'], 'payment', 'payment pending', {'Amount': '$149.99'})
         send_status_update(test_data['order_number'], 'payment', 'paid', {'Amount': '$149.99', 'Method': 'Credit Card'})
-        send_status_update(test_data['order_number'], 'fulfillment', 'in progress', {})
-        send_status_update(test_data['order_number'], 'fulfillment', 'fulfilled', {'Tracking': 'TRK123456'})
         
         return jsonify({
             'success': True,
             'order': test_data['order_number'],
-            'message': 'PROPER table format sent. Check #shopify-slack channel!'
+            'message': 'HORIZONTAL table sent. Check #shopify-slack!'
         })
     
     return jsonify({'error': 'Failed to send'}), 500
+
+@app.route('/test-multiple', methods=['GET'])
+def test_multiple():
+    """Test with longer item name"""
+    test_data = {
+        'order_number': '1258',
+        'customer': {
+            'name': 'John Smith',
+            'phone': '+971501234567'
+        },
+        'line_items': [
+            {
+                'name': 'Abercrombie & Fitch Authentic Night 100 ml EDP Women Perfume Long Name Test',
+                'variant_title': 'Premium Edition',
+                'quantity': 2
+            }
+        ]
+    }
+    
+    thread_ts = send_order_notification(test_data)
+    
+    if thread_ts:
+        return jsonify({
+            'success': True,
+            'order': test_data['order_number'],
+            'note': 'Long item name truncated in horizontal table'
+        })
+    
+    return jsonify({'error': 'Failed'}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -359,20 +362,19 @@ def home():
     return '''
     <html>
         <body style="font-family: Arial, sans-serif; padding: 20px;">
-            <h1>✅ Shopify → Slack (Table Format)</h1>
-            <p><strong>Table Format Example:</strong></p>
+            <h1>✅ Shopify → Slack (Horizontal Table)</h1>
+            <p><strong>Horizontal Table Format:</strong></p>
             <pre style="background: #f5f5f5; padding: 10px; border-radius: 5px;">
 📦 NEW ORDER
-┌─────────────────────────────────────┐
-│ Order #:     1257                   │
-│ Customer:    Ahsana                 │
-│ Phone:       +971 545982212         │
-│ Item:        Ahmed Al Maghribi...   │
-│ Quantity:    1                      │
-└─────────────────────────────────────┘
+┌──────────┬────────────┬────────────┬────────────────────┬───────┐
+│ Order #  │ Customer   │ Phone      │ Item               │ Qty   │
+├──────────┼────────────┼────────────┼────────────────────┼───────┤
+│ 1257     │ Ahsana     │ +971 5459..│ Ahmed Al Maghribi..│ 1     │
+└──────────┴────────────┴────────────┴────────────────────┴───────┘
             </pre>
             <hr>
-            <p><a href="/test-table">/test-table</a> - Test table format</p>
+            <p><a href="/test-horizontal">/test-horizontal</a> - Test horizontal table</p>
+            <p><a href="/test-multiple">/test-multiple</a> - Test with long item name</p>
             <p><a href="/health">/health</a> - Health check</p>
         </body>
     </html>
