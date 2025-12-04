@@ -203,10 +203,11 @@ def shopify_webhook():
         if not data:
             return jsonify({'error': 'No data received'}), 400
 
-        webhook_topic = request.headers.get('X-Shopify-Topic', 'unknown')
+        webhook_topic = (request.headers.get('X-Shopify-Topic') or '').lower()
         order_number = data.get('order_number') or data.get('name') or str(data.get('id', 'unknown'))
         financial_status = data.get('financial_status') or data.get('payment_status') or ''
         fulfillment_status = data.get('fulfillment_status') or ''
+        # total_price left here but we no longer include amount in messages
         total_price = data.get('total_price') or data.get('total_price_set', {}).get('presentment_money', {}).get('amount')
 
         status_mapping = {
@@ -217,8 +218,30 @@ def shopify_webhook():
         payment_status = status_mapping.get((financial_status or '').lower(), financial_status)
         fulfillment_status_mapped = status_mapping.get((fulfillment_status or '').lower(), fulfillment_status)
 
+        # Decide which types this webhook should handle based on topic
+        webhook_topic_lower = webhook_topic or ''
+        should_handle_payment = True
+        should_handle_fulfillment = True
+
+        if 'fulfill' in webhook_topic_lower:
+            # fulfillment-specific webhook -> do not handle payment here
+            should_handle_payment = False
+            should_handle_fulfillment = True
+        elif 'paid' in webhook_topic_lower or 'payment' in webhook_topic_lower:
+            # payment-specific webhook -> do not handle fulfillment here
+            should_handle_payment = True
+            should_handle_fulfillment = False
+        elif webhook_topic_lower == 'orders/updated':
+            # ambiguous: we'll handle only values that actually changed compared to stored last-known
+            should_handle_payment = True
+            should_handle_fulfillment = True
+        else:
+            # default: keep previous behavior (handle both but guard by "only if changed")
+            should_handle_payment = True
+            should_handle_fulfillment = True
+
         # Only handle updates (we do NOT create initial message here)
-        if webhook_topic in ('orders/updated', 'orders/paid', 'fulfillments/create', 'fulfillments/update'):
+        if webhook_topic_lower in ('orders/updated', 'orders/paid', 'fulfillments/create', 'fulfillments/update', 'orders/paid'):
             mapping = ensure_thread_for_order(order_number)
             if not mapping:
                 app.logger.warning("No Slack message found for order %s yet. Will wait for a copy into channel.", order_number)
@@ -228,21 +251,19 @@ def shopify_webhook():
             last_payment = mapping.get("last_payment")
             last_fulfillment = mapping.get("last_fulfillment")
 
-            # PAYMENT: only post if payment_status is present and different from last_payment
-            if payment_status and (str(payment_status) != str(last_payment)):
-                # We intentionally do NOT include amount
+            # PAYMENT: only post if this webhook is allowed to handle payment and payment_status changed
+            if should_handle_payment and payment_status and (str(payment_status) != str(last_payment)):
                 details = {}
                 if data.get('gateway'):
                     details['Method'] = data.get('gateway')
                 text = create_status_text('payment', payment_status, details)
                 posted = post_thread_message(mapping['channel'], mapping['ts'], text)
                 if posted:
-                    # update stored last payment
                     mapping['last_payment'] = payment_status
                     save_mapping(order_number, mapping['ts'], channel=mapping['channel'], last_payment=payment_status, last_fulfillment=mapping.get('last_fulfillment'))
 
-            # FULFILLMENT: only post if fulfillment_status is present and different from last_fulfillment
-            if fulfillment_status and (str(fulfillment_status_mapped) != str(last_fulfillment)):
+            # FULFILLMENT: only post if this webhook is allowed to handle fulfillment and fulfillment_status changed
+            if should_handle_fulfillment and fulfillment_status and (str(fulfillment_status_mapped) != str(last_fulfillment)):
                 fdetails = {}
                 if data.get('tracking_numbers'):
                     fdetails['Tracking'] = ', '.join(data.get('tracking_numbers', []))
@@ -251,13 +272,12 @@ def shopify_webhook():
                 text2 = create_status_text('fulfillment', fulfillment_status_mapped, fdetails)
                 posted2 = post_thread_message(mapping['channel'], mapping['ts'], text2)
                 if posted2:
-                    # update stored last fulfillment
                     mapping['last_fulfillment'] = fulfillment_status_mapped
                     save_mapping(order_number, mapping['ts'], channel=mapping['channel'], last_payment=mapping.get('last_payment'), last_fulfillment=fulfillment_status_mapped)
 
             return jsonify({'ok': True, 'order': order_number}), 200
 
-        if webhook_topic == 'orders/create':
+        if webhook_topic_lower == 'orders/create':
             app.logger.info("Received orders/create for %s: doing nothing (Flow handles creation).", order_number)
             return jsonify({'ok': True, 'note': 'creation handled by Flow/Incoming Webhook'}), 200
 
