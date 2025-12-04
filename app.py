@@ -57,18 +57,18 @@ def create_horizontal_table(order_data):
             quantity = str(first_item.get('quantity', 1))
         
         # Truncate for horizontal display
-        order_display = truncate_text(order_number, 12)
-        customer_display = truncate_text(customer_name, 14)
-        phone_display = truncate_text(phone, 14)
-        item_display = truncate_text(item_info, 20)
-        quantity_display = truncate_text(quantity, 5)
+        order_display = truncate_text(order_number, 18)
+        customer_display = truncate_text(customer_name, 18)
+        phone_display = truncate_text(phone, 17)
+        item_display = truncate_text(item_info, 25)
+        quantity_display = truncate_text(quantity, 8)
         
         # Create HORIZONTAL table (single line)
         message = "📦 *NEW ORDER*\n"
         message += "┌──────────┬────────────┬────────────┬────────────────────┬───────┐\n"
-        message += f"│ Order #  │ Customer   │ Phone      │ Item               │ Qty   │\n"
+        message +=f"│ Order #  │ Customer   │ Phone      │ Item               │ Qty   │\n"
         message += "├──────────┼────────────┼────────────┼────────────────────┼───────┤\n"
-        message += f"│ {order_display:<8} │ {customer_display:<10} │ {phone_display:<10} │ {item_display:<18} │ {quantity_display:<5} │\n"
+        message +=f"│ {order_display:<8} │ {customer_display:<10} │ {phone_display:<10} │ {item_display:<18} │ {quantity_display:<5} │\n"
         message += "└──────────┴────────────┴────────────┴────────────────────┴───────┘"
         
         return message
