@@ -7,46 +7,89 @@ import re
 app = Flask(__name__)
 
 SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN')
-SHOPIFY_SLACK_CHANNEL_ID = os.getenv('SHOPIFY_SLACK_CHANNEL_ID', 'C0A068PHZMY')
 
-# Store: {order_number: {'ts': 'thread_timestamp', 'payment': 'status', 'fulfillment': 'status'}}
+# List of channels to search for orders
+CHANNELS_TO_SEARCH = [
+    'C0A02M2VCTB',  # "order" channel ID
+    'C0A068PHZMY'   # "shopify-slack" channel ID
+]
+
+if not SLACK_BOT_TOKEN:
+    print("⚠️ WARNING: SLACK_BOT_TOKEN not configured")
+
+# Store: {order_number: {'ts': 'thread_timestamp', 'channel': 'channel_id', 'payment': 'status', 'fulfillment': 'status'}}
 order_tracking = {}
 
-def find_order_message(order_number):
-    """Find order message in Slack channel"""
+def find_order_message_in_channels(order_number):
+    """Search for order message in ALL specified channels"""
     if not SLACK_BOT_TOKEN:
-        return None
+        return None, None
     
     clean_num = str(order_number).replace("#", "").strip()
     
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
-    params = {"channel": SHOPIFY_SLACK_CHANNEL_ID, "limit": 50}
     
-    try:
-        resp = requests.get("https://slack.com/api/conversations.history", 
-                          headers=headers, params=params, timeout=10)
-        data = resp.json()
+    for channel_id in CHANNELS_TO_SEARCH:
+        params = {"channel": channel_id, "limit": 50}
         
-        if data.get("ok"):
-            for msg in data.get("messages", []):
-                text = msg.get("text", "")
-                # Look for order number
-                match = re.search(r'ST\.order\s*#?(\d+)', text, re.IGNORECASE)
-                if match and match.group(1) == clean_num:
-                    return msg.get("ts")
-    except Exception:
-        pass
+        try:
+            resp = requests.get("https://slack.com/api/conversations.history", 
+                              headers=headers, params=params, timeout=10)
+            data = resp.json()
+            
+            if data.get("ok"):
+                for msg in data.get("messages", []):
+                    text = msg.get("text", "")
+                    # Look for order number in various formats
+                    if check_if_order_message(text, clean_num):
+                        print(f"✅ Found order #{order_number} in channel {channel_id}")
+                        return msg.get("ts"), channel_id
+                        
+        except Exception as e:
+            print(f"Error searching channel {channel_id}: {e}")
     
-    return None
+    print(f"❌ Order #{order_number} not found in any channel")
+    return None, None
 
-def post_to_slack(thread_ts, text):
-    """Post message to Slack thread"""
+def check_if_order_message(text, order_number):
+    """Check if message contains the order number"""
+    if not text:
+        return False
+    
+    text_lower = text.lower()
+    
+    # Pattern 1: ST.order #1234 (from shopify-slack channel)
+    match = re.search(r'st\.order\s*#?(\d+)', text_lower)
+    if match and match.group(1) == order_number:
+        return True
+    
+    # Pattern 2: Just the order number (for order channel messages)
+    if f"#{order_number}" in text or f"order #{order_number}" in text_lower:
+        return True
+    
+    # Pattern 3: Order number mentioned in various formats
+    patterns = [
+        rf'order.*#{order_number}',
+        rf'order.*{order_number}',
+        rf'#{order_number}.*order',
+        rf'\b{order_number}\b.*order',
+        rf'order.*\b{order_number}\b'
+    ]
+    
+    for pattern in patterns:
+        if re.search(pattern, text_lower, re.IGNORECASE):
+            return True
+    
+    return False
+
+def post_to_slack(channel_id, thread_ts, text):
+    """Post message to Slack thread in specific channel"""
     if not SLACK_BOT_TOKEN:
         return False
     
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
     payload = {
-        "channel": SHOPIFY_SLACK_CHANNEL_ID,
+        "channel": channel_id,
         "thread_ts": thread_ts,
         "text": text
     }
@@ -116,7 +159,7 @@ def normalize_status(status, status_type='payment'):
 
 @app.route('/webhook/shopify', methods=['POST'])
 def shopify_webhook():
-    """Handle Shopify webhooks - SIMPLE VERSION"""
+    """Handle Shopify webhooks"""
     try:
         data = request.get_json()
         if not data:
@@ -124,7 +167,7 @@ def shopify_webhook():
         
         # Get webhook topic
         topic = request.headers.get('X-Shopify-Topic', '').lower()
-        print(f"Webhook topic: {topic}")
+        print(f"📋 Webhook topic: {topic}")
         
         # Get order data
         order_data = data.get('order') or data
@@ -135,90 +178,124 @@ def shopify_webhook():
             order_number = order_data.get('id')
         
         if not order_number:
-            print("No order number found")
+            print("❌ No order number found")
             return jsonify({'error': 'No order number'}), 400
         
         # Clean order number
         clean_order = str(order_number).replace("#", "").strip()
-        print(f"Processing order: #{clean_order}")
+        print(f"🔢 Processing order: #{clean_order}")
         
         # Get statuses
         financial_status = order_data.get('financial_status')
         fulfillment_status = order_data.get('fulfillment_status')
         
-        print(f"Financial: {financial_status}, Fulfillment: {fulfillment_status}")
+        print(f"💰 Financial: {financial_status}, 📦 Fulfillment: {fulfillment_status}")
         
         # Normalize statuses
         payment_status = normalize_status(financial_status, 'payment') if financial_status else None
         fulfillment_status_norm = normalize_status(fulfillment_status, 'fulfillment') if fulfillment_status else None
         
-        print(f"Normalized - Payment: {payment_status}, Fulfillment: {fulfillment_status_norm}")
+        print(f"🔄 Normalized - Payment: {payment_status}, Fulfillment: {fulfillment_status_norm}")
         
-        # Find or create tracking
-        if clean_order not in order_tracking:
-            print(f"Looking for order #{clean_order} in Slack...")
-            thread_ts = find_order_message(clean_order)
-            if not thread_ts:
-                print(f"Order #{clean_order} not found in Slack")
-                return jsonify({'ok': False, 'message': 'Order not found in Slack'}), 202
+        # Check if we already have this order tracked
+        if clean_order in order_tracking:
+            tracking = order_tracking[clean_order]
+            print(f"📊 Found existing tracking for order #{clean_order} in channel {tracking.get('channel')}")
+        else:
+            # Search for order in all channels
+            print(f"🔍 Searching for order #{clean_order} in all channels...")
+            thread_ts, found_channel = find_order_message_in_channels(clean_order)
             
-            print(f"Found order #{clean_order} at timestamp: {thread_ts}")
+            if not thread_ts:
+                print(f"❌ Order #{clean_order} not found in any channel")
+                return jsonify({'ok': False, 'message': f'Order #{clean_order} not found in Slack'}), 202
+            
+            print(f"✅ Found order #{clean_order} in channel {found_channel}")
             order_tracking[clean_order] = {
                 'ts': thread_ts,
+                'channel': found_channel,
                 'payment': None,
                 'fulfillment': None
             }
+            tracking = order_tracking[clean_order]
         
-        tracking = order_tracking[clean_order]
         time_now = datetime.now().strftime("%I:%M %p")
         
         # Debug current state
-        print(f"Current tracking - Payment: {tracking.get('payment')}, Fulfillment: {tracking.get('fulfillment')}")
+        print(f"📝 Current tracking - Channel: {tracking.get('channel')}, Payment: {tracking.get('payment')}, Fulfillment: {tracking.get('fulfillment')}")
         
         # Handle payment update
         if payment_status and payment_status != tracking.get('payment'):
-            print(f"Payment status changed: {tracking.get('payment')} -> {payment_status}")
+            print(f"🔄 Payment status changed: {tracking.get('payment')} -> {payment_status}")
             status_text = get_payment_message(payment_status)
             message = f"{status_text} • {time_now}"
             
-            print(f"Posting payment update: {message}")
-            if post_to_slack(tracking['ts'], message):
+            print(f"📤 Posting payment update to channel {tracking['channel']}: {message}")
+            if post_to_slack(tracking['channel'], tracking['ts'], message):
                 tracking['payment'] = payment_status
-                print(f"Payment update posted successfully")
+                print(f"✅ Payment update posted successfully")
             else:
-                print(f"Failed to post payment update")
+                print(f"❌ Failed to post payment update")
         
         # Handle fulfillment update
         if fulfillment_status_norm and fulfillment_status_norm != tracking.get('fulfillment'):
-            print(f"Fulfillment status changed: {tracking.get('fulfillment')} -> {fulfillment_status_norm}")
+            print(f"🔄 Fulfillment status changed: {tracking.get('fulfillment')} -> {fulfillment_status_norm}")
             status_text = get_fulfillment_message(fulfillment_status_norm)
             message = f"{status_text} • {time_now}"
             
-            print(f"Posting fulfillment update: {message}")
-            if post_to_slack(tracking['ts'], message):
+            print(f"📤 Posting fulfillment update to channel {tracking['channel']}: {message}")
+            if post_to_slack(tracking['channel'], tracking['ts'], message):
                 tracking['fulfillment'] = fulfillment_status_norm
-                print(f"Fulfillment update posted successfully")
+                print(f"✅ Fulfillment update posted successfully")
             else:
-                print(f"Failed to post fulfillment update")
+                print(f"❌ Failed to post fulfillment update")
         
-        return jsonify({'ok': True, 'order': clean_order}), 200
+        return jsonify({'ok': True, 'order': clean_order, 'channel': tracking.get('channel')}), 200
         
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"❌ Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/force-update/<order_number>/<status_type>/<status>', methods=['GET'])
-def force_update(order_number, status_type, status):
-    """Force update for testing"""
+@app.route('/find-order/<order_number>', methods=['GET'])
+def find_order(order_number):
+    """Find an order in any channel"""
+    clean_order = str(order_number).replace("#", "").strip()
+    thread_ts, channel_id = find_order_message_in_channels(clean_order)
+    
+    if thread_ts:
+        return jsonify({
+            'found': True,
+            'order': clean_order,
+            'channel': channel_id,
+            'thread_ts': thread_ts
+        }), 200
+    else:
+        return jsonify({
+            'found': False,
+            'order': clean_order,
+            'message': 'Not found in any channel'
+        }), 404
+
+@app.route('/test-update/<order_number>/<status_type>/<status>', methods=['GET'])
+def test_update(order_number, status_type, status):
+    """Test update for specific order"""
     clean_order = str(order_number).replace("#", "").strip()
     
-    if clean_order not in order_tracking:
-        thread_ts = find_order_message(clean_order)
+    if clean_order in order_tracking:
+        tracking = order_tracking[clean_order]
+    else:
+        thread_ts, channel_id = find_order_message_in_channels(clean_order)
         if not thread_ts:
             return jsonify({'error': 'Order not found'}), 404
-        order_tracking[clean_order] = {'ts': thread_ts, 'payment': None, 'fulfillment': None}
+        
+        order_tracking[clean_order] = {
+            'ts': thread_ts,
+            'channel': channel_id,
+            'payment': None,
+            'fulfillment': None
+        }
+        tracking = order_tracking[clean_order]
     
-    tracking = order_tracking[clean_order]
     time_now = datetime.now().strftime("%I:%M %p")
     
     if status_type == 'payment':
@@ -229,70 +306,65 @@ def force_update(order_number, status_type, status):
         tracking['fulfillment'] = status
     
     message = f"{status_text} • {time_now}"
-    success = post_to_slack(tracking['ts'], message)
+    success = post_to_slack(tracking['channel'], tracking['ts'], message)
     
     return jsonify({
         'ok': success,
         'order': clean_order,
+        'channel': tracking['channel'],
         'message': message,
         'status_type': status_type,
         'status': status
     })
 
-@app.route('/debug/<order_number>', methods=['GET'])
-def debug_order(order_number):
-    """Debug order tracking"""
-    clean_order = str(order_number).replace("#", "").strip()
-    
-    if clean_order in order_tracking:
-        return jsonify({
-            'found': True,
-            'order': clean_order,
-            'tracking': order_tracking[clean_order]
-        })
-    
-    # Try to find in Slack
-    thread_ts = find_order_message(clean_order)
-    if thread_ts:
-        return jsonify({
-            'found_in_slack': True,
-            'order': clean_order,
-            'thread_ts': thread_ts,
-            'tracking': 'Not yet tracked'
-        })
-    
+@app.route('/tracked-orders', methods=['GET'])
+def tracked_orders():
+    """Show all tracked orders"""
     return jsonify({
-        'found': False,
-        'order': clean_order,
-        'message': 'Not found in Slack or tracking'
-    })
+        'total_orders': len(order_tracking),
+        'orders': order_tracking
+    }), 200
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
         'status': 'ok',
         'orders_tracked': len(order_tracking),
-        'channel': SHOPIFY_SLACK_CHANNEL_ID
+        'channels_searched': CHANNELS_TO_SEARCH,
+        'channels_count': len(CHANNELS_TO_SEARCH)
     }), 200
 
 @app.route('/', methods=['GET'])
 def home():
     return f"""
-    <h2>Shopify Status Bot - DEBUG VERSION</h2>
-    <p><strong>Orders tracked:</strong> {len(order_tracking)}</p>
-    <p><strong>Channel:</strong> {SHOPIFY_SLACK_CHANNEL_ID}</p>
-    <p><strong>Issue:</strong> Payment updates not posting</p>
+    <h2>🛍️ Shopify Status Bot - MULTI-CHANNEL</h2>
     
-    <h3>Debug Tools:</h3>
+    <div style="background: #f0f8ff; padding: 20px; border-radius: 10px; margin: 20px 0;">
+        <h3>📍 Working in BOTH channels:</h3>
+        <ul>
+            <li><strong>order channel</strong> (C0A02M2VCTB) - Original notifications</li>
+            <li><strong>shopify-slack channel</strong> (C0A068PHZMY) - Copy-pasted notifications</li>
+        </ul>
+    </div>
+    
+    <p><strong>📊 Orders currently tracked:</strong> {len(order_tracking)}</p>
+    
+    <h3>🔧 Tools:</h3>
     <ul>
         <li><a href="/health">Health Check</a></li>
-        <li><a href="/debug/1278">Debug Order 1278</a></li>
-        <li><a href="/force-update/1278/payment/paid">Force Payment Update</a></li>
-        <li><a href="/force-update/1278/fulfillment/fulfilled">Force Fulfillment Update</a></li>
+        <li><a href="/tracked-orders">All Tracked Orders</a></li>
+        <li><a href="/find-order/1281">Find Order 1281</a></li>
+        <li><a href="/test-update/1281/payment/paid">Test Payment Update</a></li>
+        <li><a href="/test-update/1281/fulfillment/fulfilled">Test Fulfillment Update</a></li>
     </ul>
     
-    <h3>Current Tracking:</h3>
-    <pre>{order_tracking}</pre>
+    <h3>🎯 How it works:</h3>
+    <ol>
+        <li>When Shopify sends a webhook, bot searches BOTH channels for the order</li>
+        <li>Finds the order message (wherever it exists)</li>
+        <li>Posts status update in thread of that message</li>
+        <li>Remembers which channel each order is in</li>
+    </ol>
     """
 
 if __name__ == '__main__':
