@@ -113,8 +113,8 @@ def get_payment_message(status):
     status_lower = status.lower() if status else ''
     return status_map.get(status_lower, f'💳 {status}')
 
-def get_fulfillment_message(status):
-    """Create fulfillment status message"""
+def get_fulfillment_message(status, tracking_number=None, courier=None):
+    """Create fulfillment status message with tracking and courier info"""
     status_map = {
         'fulfilled': '🚀 Fulfilled',
         'partially fulfilled': '📤 Partially Fulfilled',
@@ -123,7 +123,22 @@ def get_fulfillment_message(status):
         'unfulfilled': '📦 Unfulfilled',
     }
     status_lower = status.lower() if status else ''
-    return status_map.get(status_lower, f'📦 {status}')
+    
+    # Get the base status message
+    base_message = status_map.get(status_lower, f'📦 {status}')
+    
+    # Add tracking and courier info for fulfilled status
+    if status_lower == 'fulfilled' and (tracking_number or courier):
+        details = []
+        if tracking_number:
+            details.append(f"Tracking: {tracking_number}")
+        if courier:
+            details.append(f"Courier: {courier}")
+        
+        if details:
+            base_message += f" ({', '.join(details)})"
+    
+    return base_message
 
 def normalize_status(status, status_type='payment'):
     """Normalize Shopify status to our format"""
@@ -156,6 +171,23 @@ def normalize_status(status, status_type='payment'):
             return 'unfulfilled'
     
     return status_lower
+
+def get_tracking_info_from_fulfillments(fulfillments):
+    """Extract tracking number and courier from fulfillments"""
+    if not fulfillments:
+        return None, None
+    
+    # Get the latest fulfillment
+    latest_fulfillment = fulfillments[-1]
+    
+    tracking_number = latest_fulfillment.get('tracking_number') or latest_fulfillment.get('tracking_number')
+    courier = latest_fulfillment.get('tracking_company') or latest_fulfillment.get('shipping_company')
+    
+    # Clean up the courier name
+    if courier:
+        courier = courier.title()
+    
+    return tracking_number, courier
 
 @app.route('/webhook/shopify', methods=['POST'])
 def shopify_webhook():
@@ -190,6 +222,27 @@ def shopify_webhook():
         fulfillment_status = order_data.get('fulfillment_status')
         
         print(f"💰 Financial: {financial_status}, 📦 Fulfillment: {fulfillment_status}")
+        
+        # Get tracking info from fulfillments if available
+        tracking_number = None
+        courier = None
+        
+        # Check for fulfillments data in the webhook
+        fulfillments = order_data.get('fulfillments')
+        if fulfillments:
+            print(f"📦 Found {len(fulfillments)} fulfillment(s)")
+            tracking_number, courier = get_tracking_info_from_fulfillments(fulfillments)
+            print(f"📮 Tracking info - Number: {tracking_number}, Courier: {courier}")
+        
+        # Also check for shipping lines which might contain tracking info
+        shipping_lines = order_data.get('shipping_lines')
+        if shipping_lines and not tracking_number:
+            for shipping_line in shipping_lines:
+                if shipping_line.get('source') == 'shopify':
+                    tracking_number = shipping_line.get('tracking_number')
+                    if shipping_line.get('title'):
+                        courier = shipping_line.get('title').title()
+                    break
         
         # Normalize statuses
         payment_status = normalize_status(financial_status, 'payment') if financial_status else None
@@ -240,7 +293,13 @@ def shopify_webhook():
         # Handle fulfillment update
         if fulfillment_status_norm and fulfillment_status_norm != tracking.get('fulfillment'):
             print(f"🔄 Fulfillment status changed: {tracking.get('fulfillment')} -> {fulfillment_status_norm}")
-            status_text = get_fulfillment_message(fulfillment_status_norm)
+            
+            # Special handling for fulfilled status with tracking info
+            if fulfillment_status_norm == 'fulfilled' and (tracking_number or courier):
+                status_text = get_fulfillment_message(fulfillment_status_norm, tracking_number, courier)
+            else:
+                status_text = get_fulfillment_message(fulfillment_status_norm)
+            
             message = f"{status_text} • {time_now}"
             
             print(f"📤 Posting fulfillment update to channel {tracking['channel']}: {message}")
@@ -281,6 +340,10 @@ def test_update(order_number, status_type, status):
     """Test update for specific order"""
     clean_order = str(order_number).replace("#", "").strip()
     
+    # Optional query parameters for tracking info
+    tracking_number = request.args.get('tracking', None)
+    courier = request.args.get('courier', None)
+    
     if clean_order in order_tracking:
         tracking = order_tracking[clean_order]
     else:
@@ -302,7 +365,11 @@ def test_update(order_number, status_type, status):
         status_text = get_payment_message(status)
         tracking['payment'] = status
     else:
-        status_text = get_fulfillment_message(status)
+        # Use tracking info if provided for fulfilled status
+        if status.lower() == 'fulfilled' and (tracking_number or courier):
+            status_text = get_fulfillment_message(status, tracking_number, courier)
+        else:
+            status_text = get_fulfillment_message(status)
         tracking['fulfillment'] = status
     
     message = f"{status_text} • {time_now}"
@@ -314,7 +381,9 @@ def test_update(order_number, status_type, status):
         'channel': tracking['channel'],
         'message': message,
         'status_type': status_type,
-        'status': status
+        'status': status,
+        'tracking_number': tracking_number,
+        'courier': courier
     })
 
 @app.route('/tracked-orders', methods=['GET'])
@@ -355,7 +424,7 @@ def home():
         <li><a href="/tracked-orders">All Tracked Orders</a></li>
         <li><a href="/find-order/1281">Find Order 1281</a></li>
         <li><a href="/test-update/1281/payment/paid">Test Payment Update</a></li>
-        <li><a href="/test-update/1281/fulfillment/fulfilled">Test Fulfillment Update</a></li>
+        <li><a href="/test-update/1281/fulfillment/fulfilled?tracking=1Z999AA10123456784&courier=UPS">Test Fulfillment Update with Tracking</a></li>
     </ul>
     
     <h3>🎯 How it works:</h3>
@@ -363,8 +432,17 @@ def home():
         <li>When Shopify sends a webhook, bot searches BOTH channels for the order</li>
         <li>Finds the order message (wherever it exists)</li>
         <li>Posts status update in thread of that message</li>
+        <li>For fulfilled orders, includes tracking number and courier if available</li>
         <li>Remembers which channel each order is in</li>
     </ol>
+    
+    <h3>📮 Fulfillment Messages:</h3>
+    <ul>
+        <li><code>🚀 Fulfilled • 02:30 PM</code> - Basic fulfillment</li>
+        <li><code>🚀 Fulfilled (Tracking: 1Z999AA10123456784, Courier: UPS) • 02:30 PM</code> - With tracking info</li>
+        <li><code>🚀 Fulfilled (Tracking: 1Z999AA10123456784) • 02:30 PM</code> - With tracking only</li>
+        <li><code>🚀 Fulfilled (Courier: FedEx) • 02:30 PM</code> - With courier only</li>
+    </ul>
     """
 
 if __name__ == '__main__':
