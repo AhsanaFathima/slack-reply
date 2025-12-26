@@ -1,20 +1,22 @@
 import os
+import re
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime
-import re
 
 app = Flask(__name__)
 
+# ---------------- ENV ----------------
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
+SHOPIFY_SHOP_NAME = os.getenv("SHOPIFY_SHOP_NAME")
 
-# Channels where NEW ORDER notifications may exist
 CHANNELS_TO_SEARCH = [
     "C0A02M2VCTB",  # order
     "C0A068PHZMY"   # shopify-slack
 ]
 
-# In-memory store (replace with DB/Redis in production)
+# In-memory tracking (use DB/Redis in prod)
 order_tracking = {}
 
 # --------------------------------------------------
@@ -24,15 +26,13 @@ def is_new_order_message(text, order_number):
     if not text:
         return False
 
-    text_lower = text.lower().strip()
+    text = text.lower().strip()
 
-    # ❌ Ignore reports, fulfillment lists, summaries
     blacklist = ["fulfilled", "tracking", "report", "generated", "payment"]
-    if any(word in text_lower for word in blacklist):
+    if any(word in text for word in blacklist):
         return False
 
-    # ✅ Only allow exact new order format
-    match = re.search(r"\bst\.order\s+#?(\d+)\b", text_lower)
+    match = re.search(r"\bst\.order\s+#?(\d+)\b", text)
     return bool(match and match.group(1) == order_number)
 
 
@@ -42,26 +42,21 @@ def is_new_order_message(text, order_number):
 def find_new_order_message(order_number):
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
 
-    for channel_id in CHANNELS_TO_SEARCH:
-        try:
-            resp = requests.get(
-                "https://slack.com/api/conversations.history",
-                headers=headers,
-                params={"channel": channel_id, "limit": 100},
-                timeout=10
-            )
+    for channel in CHANNELS_TO_SEARCH:
+        resp = requests.get(
+            "https://slack.com/api/conversations.history",
+            headers=headers,
+            params={"channel": channel, "limit": 100},
+            timeout=10
+        )
 
-            data = resp.json()
-            if not data.get("ok"):
-                continue
+        data = resp.json()
+        if not data.get("ok"):
+            continue
 
-            # Oldest → newest (important!)
-            for msg in reversed(data.get("messages", [])):
-                if is_new_order_message(msg.get("text", ""), order_number):
-                    return msg["ts"], channel_id
-
-        except Exception as e:
-            print(f"Slack search error: {e}")
+        for msg in reversed(data.get("messages", [])):
+            if is_new_order_message(msg.get("text", ""), order_number):
+                return msg["ts"], channel
 
     return None, None
 
@@ -76,8 +71,14 @@ def post_thread_message(channel, thread_ts, text):
         "thread_ts": thread_ts,
         "text": text
     }
-    r = requests.post("https://slack.com/api/chat.postMessage",
-                      headers=headers, json=payload, timeout=10)
+
+    r = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers=headers,
+        json=payload,
+        timeout=10
+    )
+
     return r.json().get("ok", False)
 
 
@@ -115,46 +116,99 @@ def fulfillment_message(status, tracking=None, courier=None):
     return msg
 
 
+def stock_message(status):
+    if status.lower() == "stock available":
+        return "📦 Stock Available"
+    elif status.lower() == "stock not available":
+        return "❌ Stock Not Available"
+    return f"📦 Stock Status: {status}"
+
+
+# --------------------------------------------------
+# 📦 FETCH STOCK STATUS FROM SHOPIFY (GRAPHQL)
+# --------------------------------------------------
+def fetch_stock_status_from_shopify(order_id):
+    if not SHOPIFY_ACCESS_TOKEN or not SHOPIFY_SHOP_NAME:
+        print("❌ Missing Shopify credentials")
+        return None
+
+    url = f"https://{SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/2025-01/graphql.json"
+
+    query = """
+    query ($id: ID!) {
+      order(id: $id) {
+        metafield(namespace: "custom", key: "stock_status") {
+          value
+        }
+      }
+    }
+    """
+
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+        "Content-Type": "application/json"
+    }
+
+    resp = requests.post(
+        url,
+        json={
+            "query": query,
+            "variables": {"id": f"gid://shopify/Order/{order_id}"}
+        },
+        headers=headers,
+        timeout=10
+    )
+
+    data = resp.json()
+    return (
+        data.get("data", {})
+        .get("order", {})
+        .get("metafield", {})
+        .get("value")
+    )
+
+
 # --------------------------------------------------
 # 🛒 SHOPIFY WEBHOOK
 # --------------------------------------------------
 @app.route("/webhook/shopify", methods=["POST"])
 def shopify_webhook():
     data = request.get_json(force=True)
-
     order = data.get("order", data)
-    order_number = str(order.get("name", "")).replace("#", "").strip()
 
+    order_number = str(order.get("name", "")).replace("#", "").strip()
     if not order_number:
         return jsonify({"error": "order number missing"}), 400
 
-    # Find or cache thread
     if order_number not in order_tracking:
         ts, channel = find_new_order_message(order_number)
         if not ts:
-            return jsonify({"ok": False, "message": "New order message not found"}), 202
+            return jsonify({"ok": False}), 202
 
         order_tracking[order_number] = {
             "ts": ts,
             "channel": channel,
             "payment": None,
-            "fulfillment": None
+            "fulfillment": None,
+            "stock": None
         }
 
     track = order_tracking[order_number]
     time_now = datetime.now().strftime("%I:%M %p")
 
-    # ---------------- PAYMENT ----------------
+    # -------- PAYMENT --------
     payment_status = order.get("financial_status")
     if payment_status and payment_status != track["payment"]:
-        msg = f"{payment_message(payment_status)} • {time_now}"
-        if post_thread_message(track["channel"], track["ts"], msg):
+        if post_thread_message(
+            track["channel"],
+            track["ts"],
+            f"{payment_message(payment_status)} • {time_now}"
+        ):
             track["payment"] = payment_status
 
-    # ---------------- FULFILLMENT ----------------
+    # -------- FULFILLMENT --------
     fulfillment_status = order.get("fulfillment_status")
-    tracking_no = None
-    courier = None
+    tracking_no = courier = None
 
     if order.get("fulfillments"):
         f = order["fulfillments"][-1]
@@ -162,15 +216,28 @@ def shopify_webhook():
         courier = f.get("tracking_company")
 
     if fulfillment_status and fulfillment_status != track["fulfillment"]:
-        msg = f"{fulfillment_message(fulfillment_status, tracking_no, courier)} • {time_now}"
-        if post_thread_message(track["channel"], track["ts"], msg):
+        if post_thread_message(
+            track["channel"],
+            track["ts"],
+            f"{fulfillment_message(fulfillment_status, tracking_no, courier)} • {time_now}"
+        ):
             track["fulfillment"] = fulfillment_status
+
+    # -------- STOCK STATUS --------
+    stock_status = fetch_stock_status_from_shopify(order.get("id"))
+    if stock_status and stock_status != track["stock"]:
+        if post_thread_message(
+            track["channel"],
+            track["ts"],
+            f"{stock_message(stock_status)} • {time_now}"
+        ):
+            track["stock"] = stock_status
 
     return jsonify({"ok": True}), 200
 
 
 # --------------------------------------------------
-# 🧪 HEALTH
+# 🧪 HEALTH CHECK
 # --------------------------------------------------
 @app.route("/health")
 def health():

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Environment variables (DO NOT COMMIT)
+.env
+.env.*
+.env.local
+
+# OS / Editor
+.DS_Store
+.vscode/
+
+# Logs
+*.log
