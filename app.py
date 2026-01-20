@@ -72,8 +72,12 @@ def post_thread_message(channel, thread_ts, text):
         "text": text
     }
 
-    r = requests.post("https://slack.com/api/chat.postMessage",
-                      headers=headers, json=payload, timeout=10)
+    r = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers=headers,
+        json=payload,
+        timeout=10
+    )
 
     print("📨 Slack response:", r.json())
     return r.json().get("ok", False)
@@ -158,7 +162,8 @@ def shopify_webhook():
 
     time_now = datetime.now().strftime("%I:%M %p")
 
-    payment_status = order.get("financial_status")
+    # ✅ DUPLICATION FIX (NORMALIZED)
+    payment_status = (order.get("financial_status") or "").lower().strip()
     print("💰 Payment Status:", payment_status)
 
     if payment_status and payment_status != track["payment"]:
@@ -166,8 +171,11 @@ def shopify_webhook():
         if post_thread_message(track["channel"], track["ts"], msg):
             track["payment"] = payment_status
             print("✅ Payment message sent")
+    else:
+        print("⏭️ Payment status duplicate — skipped")
 
-    fulfillment_status = order.get("fulfillment_status")
+    # ✅ DUPLICATION FIX (NORMALIZED)
+    fulfillment_status = (order.get("fulfillment_status") or "").lower().strip()
     print("📦 Fulfillment Status:", fulfillment_status)
 
     tracking_no = None
@@ -184,6 +192,8 @@ def shopify_webhook():
         if post_thread_message(track["channel"], track["ts"], msg):
             track["fulfillment"] = fulfillment_status
             print("✅ Fulfillment message sent")
+    else:
+        print("⏭️ Fulfillment status duplicate — skipped")
 
     print("🎯 Webhook processed successfully\n")
     return jsonify({"ok": True}), 200
